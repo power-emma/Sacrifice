@@ -40,6 +40,21 @@ struct MoveList
     int count;
 };
 
+// Lichess puzzle structure
+struct LichessPuzzle
+{
+    char puzzleId[32];
+    char fen[96];
+    char moves[512];      // Space-separated best moves in UCI format (e.g., "e2e4 d7d5")
+    int rating;
+    int ratingDeviation;
+    int popularity;
+    int nbPlays;
+    char themes[256];     // Space-separated themes
+    char gameUrl[256];
+    char opening[128];
+};
+
 // forward declarations
 int isCheckmate(struct Piece gameBoard[8][8], enum Colour colour);
 int isInCheck(struct Piece gameBoard[8][8], enum Colour colour);
@@ -825,7 +840,7 @@ int evaluateEndgameAdvancement(struct Piece board[8][8], int fromX, int fromY, i
         // Bonus scales with piece value and distance reduction
         // Closer proximity gets higher bonus
         // [Tuning] - King Advancement Bonus
-        int bonus = (distanceBefore - distanceAfter) * (5 - distanceAfter);
+        int bonus = (distanceBefore - distanceAfter) * (5 - distanceAfter) * 0.5;
         return bonus;
     }
 
@@ -1122,24 +1137,24 @@ struct MoveSequence moveRankingRecursiveWithSequence(
     // If either side is checkmated in this position, return immediately with extreme score
     if (isCheckmate(board, WHITE))
     {
-        best.score = -999999999; // White is checkmated
+        best.score = (player == WHITE) ? -999999999 : 999999999; // perspective relative to player
         return best;
     }
     if (isCheckmate(board, BLACK))
     {
-        best.score = 999999999; // Black is checkmated
+        best.score = (player == BLACK) ? -999999999 : 999999999; // perspective relative to player
         return best;
     }
 
     // Check for stalemate
     if (isStalemate(board, WHITE))
     {
-        best.score = -500; // Stalemate is bad for White (should avoid)
+        best.score = (player == WHITE) ? -500 : 500; // perspective relative to player
         return best;
     }
     if (isStalemate(board, BLACK))
     {
-        best.score = 500; // Stalemate is good for White (opponent can't move)
+        best.score = (player == BLACK) ? -500 : 500; // perspective relative to player
         return best;
     }
 
@@ -1160,7 +1175,8 @@ struct MoveSequence moveRankingRecursiveWithSequence(
     // Recursion base case
     if (depth >= maxDepth)
     {
-        best.score = evaluateBoardPosition(board);
+        int eval = evaluateBoardPosition(board);
+        best.score = (player == WHITE) ? eval : -eval;
         return best;
     }
 
@@ -1168,7 +1184,8 @@ struct MoveSequence moveRankingRecursiveWithSequence(
 
     if (moves.count == 0)
     {
-        best.score = evaluateBoardPosition(board);
+        int eval = evaluateBoardPosition(board);
+        best.score = (player == WHITE) ? eval : -eval;
         return best;
     }
 
@@ -1251,15 +1268,15 @@ struct MoveSequence moveRankingRecursiveWithSequence(
 }
 
 // Main move ranking function that executes best move and prints sequence
-int moveRanking(struct Piece currentBoard[8][8], int maxRecursiveDepth)
+int moveRanking(struct Piece currentBoard[8][8], int maxRecursiveDepth, enum Colour aiColour)
 {
     // Check for one-move checkmate first - Always checkmate if available
-    if (checkAndExecuteOneMoveMate(currentBoard, WHITE))
+    if (checkAndExecuteOneMoveMate(currentBoard, aiColour))
     {
         return 999999999;
     }
 
-    struct MoveSequence bestSequence = moveRankingRecursiveWithSequence(currentBoard, 0, maxRecursiveDepth, WHITE, -999999999, 999999999);
+    struct MoveSequence bestSequence = moveRankingRecursiveWithSequence(currentBoard, 0, maxRecursiveDepth, aiColour, -999999999, 999999999);
 
     if (bestSequence.count == 0)
     {
@@ -1269,7 +1286,7 @@ int moveRanking(struct Piece currentBoard[8][8], int maxRecursiveDepth)
 
     // Print the predicted move sequence
     printf("Predicted best move sequence (depth %d):\n", maxRecursiveDepth);
-    enum Colour currentPlayer = WHITE;
+    enum Colour currentPlayer = aiColour;
     for (int i = 0; i < bestSequence.count; i++)
     {
         char moveNotation[10];
@@ -1291,9 +1308,9 @@ int moveRanking(struct Piece currentBoard[8][8], int maxRecursiveDepth)
 
         char notation[10];
         sprintf(notation, "%c%d%c%d",
-                'a' + bestFromX, bestFromY + 1,
-                'a' + bestToX, bestToY + 1);
-        printf("White plays: %s\n", notation);
+            'a' + bestFromX, bestFromY + 1,
+            'a' + bestToX, bestToY + 1);
+        printf("%s plays: %s\n", aiColour == WHITE ? "White (AI)" : "Black (AI)", notation);
 
         // Check if this is a capture move (before we overwrite the destination)
         int whiteIsCapture = (board[bestToX][bestToY].type != -1);
@@ -1795,39 +1812,7 @@ int getUserMove(enum Colour colour)
     return 0;
 }
 
-int main()
-{
-    boardSetup();
-    printf("Initial board:\n");
-    printBoard();
 
-    // Black's turn - user input
-    while (1)
-    {
-        // White's turn - AI plays best move
-        printf("\n=== White's Turn ===\n");
-        moveRanking(board, 4);
-        printBoard();
-
-        int validInput = 0;
-        while (!validInput)
-        {
-            struct MoveList legalMoves = validMoves(board, BLACK);
-            // printf("Legal moves for Black:\n");
-            // for (int i = 0; i < legalMoves.count; i++) {
-            //     struct Move m = legalMoves.moves[i];
-            //     printf("  %d. %c%d%c%d\n", i + 1,
-            //         'a' + m.fromX, m.fromY + 1,
-            //         'a' + m.toX, m.toY + 1);
-            // }
-
-            validInput = getUserMove(BLACK);
-        }
-
-        printBoard();
-    }
-    return 0;
-}
 
 // Check for one-move checkmate and execute it if found
 // Returns 1 if checkmate was found and executed, 0 otherwise
@@ -1939,4 +1924,514 @@ int isCheckmate(struct Piece gameBoard[8][8], enum Colour colour)
     }
 
     return 1; // No moves get out of check, so it's checkmate
+}
+
+// Loads a puzzle from the CSV file at the specified row number
+// Returns 1 on success, 0 on failure
+int loadLichessPuzzle(const char *filename, int puzzleNumber, struct LichessPuzzle *puzzle)
+{
+    FILE *file = fopen(filename, "r");
+    if (!file)
+    {
+        printf("Error: Could not open file '%s'\n", filename);
+        return 0;
+    }
+
+    char line[2048];
+    int currentLine = 0;
+
+    // Read lines until we reach the desired puzzle number
+    while (fgets(line, sizeof(line), file))
+    {
+        if (currentLine == puzzleNumber)
+        {
+            fclose(file);
+
+            // Parse the CSV line
+            // Format: PuzzleId,FEN,Moves,Rating,RatingDeviation,Popularity,NbPlays,Themes,GameUrl,OpeningTags
+            char *token;
+            char lineCopy[2048];
+            strcpy(lineCopy, line);
+
+            // Remove trailing newline
+            if (lineCopy[strlen(lineCopy) - 1] == '\n')
+                lineCopy[strlen(lineCopy) - 1] = '\0';
+
+            // Parse each field
+            token = strtok(lineCopy, ",");
+            if (!token) return 0;
+            strcpy(puzzle->puzzleId, token);
+
+            token = strtok(NULL, ",");
+            if (!token) return 0;
+            strcpy(puzzle->fen, token);
+
+            token = strtok(NULL, ",");
+            if (!token) return 0;
+            strcpy(puzzle->moves, token);
+
+            token = strtok(NULL, ",");
+            if (!token) return 0;
+            puzzle->rating = atoi(token);
+
+            token = strtok(NULL, ",");
+            if (!token) return 0;
+            puzzle->ratingDeviation = atoi(token);
+
+            token = strtok(NULL, ",");
+            if (!token) return 0;
+            puzzle->popularity = atoi(token);
+
+            token = strtok(NULL, ",");
+            if (!token) return 0;
+            puzzle->nbPlays = atoi(token);
+
+            token = strtok(NULL, ",");
+            if (!token) return 0;
+            strcpy(puzzle->themes, token);
+
+            token = strtok(NULL, ",");
+            if (!token) return 0;
+            strcpy(puzzle->gameUrl, token);
+
+            token = strtok(NULL, ",");
+            if (token)
+                strcpy(puzzle->opening, token);
+            else
+                puzzle->opening[0] = '\0';
+
+            return 1;
+        }
+        currentLine++;
+    }
+
+    fclose(file);
+    printf("Error: Puzzle number %d not found in file\n", puzzleNumber);
+    return 0;
+}
+
+// Parses FEN string and loads it into the board
+// Returns 1 on success, 0 on failure
+int loadBoardFromFEN(const char *fen, struct Piece gameBoard[8][8])
+{
+    // Initialize empty board
+    for (int i = 0; i < 8; i++)
+    {
+        for (int j = 0; j < 8; j++)
+        {
+            gameBoard[i][j].type = -1;
+            gameBoard[i][j].colour = -1;
+            gameBoard[i][j].hasMoved = 0;
+        }
+    }
+
+    char fenCopy[256];
+    strcpy(fenCopy, fen);
+
+    // Get the board position part (before the space)
+    char *boardStr = strtok(fenCopy, " ");
+    if (!boardStr)
+        return 0;
+
+    int file = 0, rank = 7; // Start from top-left (rank 8, file a)
+
+    for (int i = 0; boardStr[i] != '\0'; i++)
+    {
+        char c = boardStr[i];
+
+        if (c == '/')
+        {
+            file = 0;
+            rank--;
+            continue;
+        }
+
+        // Empty squares
+        if (c >= '1' && c <= '8')
+        {
+            file += (c - '0');
+            continue;
+        }
+
+        if (file >= 8 || rank < 0)
+            return 0; // Invalid FEN
+
+        // Parse piece
+        enum Colour colour = (c >= 'a' && c <= 'z') ? BLACK : WHITE;
+
+        switch (c)
+        {
+        case 'P':
+        case 'p':
+            gameBoard[file][rank].type = PAWN;
+            break;
+        case 'N':
+        case 'n':
+            gameBoard[file][rank].type = KNIGHT;
+            break;
+        case 'B':
+        case 'b':
+            gameBoard[file][rank].type = BISHOP;
+            break;
+        case 'R':
+        case 'r':
+            gameBoard[file][rank].type = ROOK;
+            break;
+        case 'Q':
+        case 'q':
+            gameBoard[file][rank].type = QUEEN;
+            break;
+        case 'K':
+        case 'k':
+            gameBoard[file][rank].type = KING;
+            break;
+        default:
+            return 0; // Invalid piece
+        }
+
+        gameBoard[file][rank].colour = colour;
+        file++;
+    }
+
+    return 1;
+}
+
+// Extracts whose turn it is from FEN (returns WHITE or BLACK)
+enum Colour getTurnFromFEN(const char *fen)
+{
+    char fenCopy[256];
+    strcpy(fenCopy, fen);
+
+    strtok(fenCopy, " "); // Skip board part
+    char *turn = strtok(NULL, " ");
+
+    if (!turn)
+        return WHITE; // Default to white
+
+    return (turn[0] == 'w') ? WHITE : BLACK;
+}
+
+// Interactive function to load and display a Lichess puzzle
+// Returns 1 on success and writes the side to move into `puzzleTurnOut`.
+// Returns 0 on failure.
+int loadAndDisplayLichessPuzzle(const char *filename, enum Colour *puzzleTurnOut, struct LichessPuzzle *outPuzzle)
+{
+    int puzzleNumber;
+
+    printf("Enter the puzzle number (row index, 0-based): ");
+    fflush(stdout);
+
+    if (scanf("%d", &puzzleNumber) != 1)
+    {
+        printf("Error: Invalid input\n");
+        return 0;
+    }
+
+    if (puzzleNumber < 0)
+    {
+        printf("Error: Puzzle number must be non-negative\n");
+        return 0;
+    }
+
+    struct LichessPuzzle puzzle;
+    if (!loadLichessPuzzle(filename, puzzleNumber, &puzzle))
+    {
+        printf("Error: Failed to load puzzle\n");
+        return 0;
+    }
+
+    // Load the FEN position into the board
+    if (!loadBoardFromFEN(puzzle.fen, board))
+    {
+        printf("Error: Failed to parse FEN\n");
+        return 0;
+    }
+
+    // Get whose turn it is
+    enum Colour puzzleTurn = getTurnFromFEN(puzzle.fen);
+    if (puzzleTurnOut)
+        *puzzleTurnOut = puzzleTurn;
+    if (outPuzzle)
+        *outPuzzle = puzzle;
+
+    // Display puzzle information
+    printf("\n========== Lichess Puzzle ==========\n");
+    printf("Puzzle ID: %s\n", puzzle.puzzleId);
+    printf("Rating: %d (±%d)\n", puzzle.rating, puzzle.ratingDeviation);
+    printf("Popularity: %d%%\n", puzzle.popularity);
+    printf("Times Played: %d\n", puzzle.nbPlays);
+    printf("\nFEN: %s\n", puzzle.fen);
+    printf("Original Turn: %s\n", (puzzleTurn == WHITE) ? "White" : "Black");
+    printf("\nBest Moves: %s\n", puzzle.moves);
+    printf("\nThemes: %s\n", puzzle.themes);
+    printf("Opening: %s\n", puzzle.opening);
+    printf("Game URL: %s\n", puzzle.gameUrl);
+    printf("====================================\n\n");
+    return 1;
+}
+
+// Execute a UCI style move like "e2e4" or "e7e8q" on the given board.
+// Returns 1 on success, 0 on failure.
+int executeUciMove(struct Piece gameBoard[8][8], const char *uci)
+{
+    if (!uci || strlen(uci) < 4)
+        return 0;
+
+    int fx = uci[0] - 'a';
+    int fy = uci[1] - '1';
+    int tx = uci[2] - 'a';
+    int ty = uci[3] - '1';
+
+    if (fx < 0 || fx > 7 || tx < 0 || tx > 7 || fy < 0 || fy > 7 || ty < 0 || ty > 7)
+        return 0;
+
+    struct Piece moving = gameBoard[fx][fy];
+    if (moving.type == -1)
+        return 0; // nothing to move
+
+    // Simple move/capture
+    gameBoard[tx][ty] = moving;
+    gameBoard[fx][fy].type = -1;
+    gameBoard[fx][fy].colour = -1;
+    gameBoard[tx][ty].hasMoved = 1;
+
+    // Promotion (5th char)
+    if (strlen(uci) >= 5)
+    {
+        char pc = uci[4];
+        switch (pc)
+        {
+        case 'q': case 'Q': gameBoard[tx][ty].type = QUEEN; break;
+        case 'r': case 'R': gameBoard[tx][ty].type = ROOK; break;
+        case 'b': case 'B': gameBoard[tx][ty].type = BISHOP; break;
+        case 'n': case 'N': gameBoard[tx][ty].type = KNIGHT; break;
+        default: break;
+        }
+    }
+
+    // Castling: if king moved two squares, move rook accordingly
+    if (gameBoard[tx][ty].type == KING && abs(tx - fx) == 2)
+    {
+        int row = ty;
+        if (tx == 6)
+        {
+            gameBoard[5][row] = gameBoard[7][row];
+            gameBoard[7][row].type = -1;
+            gameBoard[7][row].colour = -1;
+            gameBoard[5][row].hasMoved = 1;
+        }
+        else if (tx == 2)
+        {
+            gameBoard[3][row] = gameBoard[0][row];
+            gameBoard[0][row].type = -1;
+            gameBoard[0][row].colour = -1;
+            gameBoard[3][row].hasMoved = 1;
+        }
+    }
+
+    // Update last move
+    lastMove.fromX = fx;
+    lastMove.fromY = fy;
+    lastMove.toX = tx;
+    lastMove.toY = ty;
+
+    // Reset halfmove clock on pawn move or capture
+    if (gameBoard[tx][ty].type == PAWN)
+        halfmoveClock = 0;
+
+    return 1;
+}
+
+// Check if a UCI move is legal for the given colour on the provided board
+int isLegalUciMove(struct Piece gameBoard[8][8], enum Colour colour, const char *uci)
+{
+    if (!uci || strlen(uci) < 4)
+        return 0;
+    int fx = uci[0] - 'a';
+    int fy = uci[1] - '1';
+    int tx = uci[2] - 'a';
+    int ty = uci[3] - '1';
+    struct MoveList moves = validMoves(gameBoard, colour);
+    for (int i = 0; i < moves.count; i++)
+    {
+        if (moves.moves[i].fromX == fx && moves.moves[i].fromY == fy && moves.moves[i].toX == tx && moves.moves[i].toY == ty)
+            return 1;
+    }
+    return 0;
+}
+
+int main()
+{
+    boardSetup();
+
+    // First, ask whether to load a puzzle. If a puzzle is loaded,
+    // infer AI colour from the puzzle (AI will play the side to move).
+    char loadChoice = 'n';
+    enum Colour aiColour = WHITE;
+    enum Colour userColour = BLACK;
+    enum Colour currentTurn = WHITE;
+
+    printf("Load a Lichess puzzle from 'lichess_db_puzzle.csv'? (y/n) [n]: ");
+    fflush(stdout);
+    if (scanf(" %c", &loadChoice) == 1 && (loadChoice == 'y' || loadChoice == 'Y'))
+    {
+        // Puzzle test loop: repeatedly ask for puzzle number, run one AI response, compare, repeat
+        for (;;)
+        {
+            enum Colour puzzleTurn = WHITE;
+            struct LichessPuzzle puzzle;
+
+            if (!loadAndDisplayLichessPuzzle("lichess_db_puzzle.csv", &puzzleTurn, &puzzle))
+            {
+                printf("Failed to load puzzle. Try another? (y/n) [y]: ");
+                char tryAgain = 'y';
+                fflush(stdout);
+                if (scanf(" %c", &tryAgain) != 1 || (tryAgain != 'y' && tryAgain != 'Y'))
+                    break;
+                else
+                    continue;
+            }
+
+            // user plays the side-to-move from the puzzle; AI plays the opponent
+            userColour = puzzleTurn;
+            aiColour = (userColour == WHITE) ? BLACK : WHITE;
+
+            // Parse puzzle moves into tokens
+            char movesCopy[512];
+            strncpy(movesCopy, puzzle.moves, sizeof(movesCopy) - 1);
+            movesCopy[sizeof(movesCopy) - 1] = '\0';
+            char *tokens[128];
+            int tokenCount = 0;
+            char *t = strtok(movesCopy, " ");
+            while (t && tokenCount < 128)
+            {
+                tokens[tokenCount++] = t;
+                t = strtok(NULL, " ");
+            }
+
+            // Reset board and load FEN for this puzzle (loadAndDisplayLichessPuzzle already loaded board)
+
+            // Step through the entire puzzle move list: even indices are puzzle (user) moves,
+            // odd indices are expected AI replies. Execute each puzzle move and let the AI
+            // respond, comparing the AI move to the expected best move.
+            if (tokenCount == 0)
+            {
+                printf("Puzzle has no moves listed.\n");
+            }
+            else
+            {
+                int allMatched = 1;
+                for (int idx = 0; idx < tokenCount; idx++)
+                {
+                    if (idx % 2 == 0)
+                    {
+                        // Puzzle (user) move
+                        const char *pMove = tokens[idx];
+                        if (!isLegalUciMove(board, userColour, pMove))
+                        {
+                            printf("Puzzle move '%s' is not legal in the current position. Aborting puzzle.\n", pMove);
+                            allMatched = 0;
+                            break;
+                        }
+                        if (!executeUciMove(board, pMove))
+                        {
+                            printf("Failed to execute puzzle move '%s'\n", pMove);
+                            allMatched = 0;
+                            break;
+                        }
+                        printf("Puzzle move played (by %s): %s\n", userColour == WHITE ? "White" : "Black", pMove);
+
+                        // If this was the last token, puzzle ends here (no AI reply expected)
+                        if (idx + 1 >= tokenCount)
+                        {
+                            printf("Puzzle concluded after last puzzle move.\n");
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        // AI to move and expected reply is tokens[idx]
+                        const char *expected = tokens[idx];
+                        moveRanking(board, 4, aiColour);
+
+                        char aiMove[16] = "";
+                        if (lastMove.fromX >= 0)
+                        {
+                            snprintf(aiMove, sizeof(aiMove), "%c%d%c%d", 'a' + lastMove.fromX, lastMove.fromY + 1, 'a' + lastMove.toX, lastMove.toY + 1);
+                        }
+
+                        if (aiMove[0] != '\0' && strcmp(aiMove, expected) == 0)
+                        {
+                            printf("AI move matches puzzle best move: %s -> passed\n", aiMove);
+                        }
+                        else
+                        {
+                            printf("AI deviated from puzzle at reply %d.\n", idx);
+                            printf("  AI move : %s\n", aiMove[0] ? aiMove : "(none)");
+                            printf("  Best move: %s\n", expected);
+                            printf("  Puzzle moves sequence: %s\n", puzzle.moves);
+                            allMatched = 0;
+                            // continue through the rest of the sequence to fully conclude
+                        }
+                    }
+                }
+
+                if (allMatched)
+                    printf("AI followed the entire puzzle sequence -> PASSED.\n");
+                else
+                    printf("AI did not fully follow puzzle sequence.\n");
+            }
+
+            // Ask whether to test another puzzle
+            char again = 'y';
+            printf("Test another puzzle? (y/n) [y]: ");
+            fflush(stdout);
+            if (scanf(" %c", &again) != 1 || (again != 'y' && again != 'Y'))
+                break;
+
+            // Reset board for next puzzle
+            boardSetup();
+        }
+    }
+    else
+    {
+        // No puzzle: ask user which color they want to play
+        char choice = 'w';
+        printf("Choose your color (w = White, b = Black) [w]: ");
+        fflush(stdout);
+        if (scanf(" %c", &choice) != 1)
+            choice = 'w';
+        userColour = (choice == 'b' || choice == 'B') ? BLACK : WHITE;
+        aiColour = (userColour == WHITE) ? BLACK : WHITE;
+        currentTurn = WHITE;
+    }
+
+    printf("Initial board:\n");
+    printBoard();
+
+    while (1)
+    {
+        if (currentTurn == aiColour)
+        {
+            printf("\n=== AI's Turn (%s) ===\n", aiColour == WHITE ? "White" : "Black");
+            moveRanking(board, 4, aiColour);
+            printBoard();
+        }
+        else
+        {
+            printf("\n=== Your Turn (%s) ===\n", userColour == WHITE ? "White" : "Black");
+            int validInput = 0;
+            while (!validInput)
+            {
+                validInput = getUserMove(userColour);
+            }
+
+            printBoard();
+        }
+
+        // Toggle turn
+        currentTurn = (currentTurn == WHITE) ? BLACK : WHITE;
+    }
+
+    return 0;
 }
