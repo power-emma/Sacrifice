@@ -430,7 +430,8 @@ int isInEndgame(struct Piece board[8][8])
     int blackMajorPieces = countMajorPieces(board, BLACK);
     int whiteMajorPieces = countMajorPieces(board, WHITE);
 
-    return (blackMajorPieces <= 2);
+    // Consider an endgame when both sides have few major pieces remaining.
+    return (blackMajorPieces <= 2 && whiteMajorPieces <= 2);
 }
 
 // Calculate square distance (Chebyshev distance) between two squares

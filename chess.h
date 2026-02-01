@@ -93,6 +93,30 @@ void promotePawn(struct Piece gameBoard[8][8], int x, int y);
 // Output helpers
 void printBoard(void);
 
+// TUI helpers
+void tui_init(void);
+void tui_cleanup(void);
+void tui_show_splash(void);
+void tui_draw_board(struct Piece board[8][8]);
+void tui_draw_stats(enum Colour current_turn);
+void tui_draw_moves(void);
+void tui_draw_info(const char *message, int is_ai_turn);
+void tui_update_stats(double think_time, unsigned long long positions, unsigned long long tt_hits, 
+                      unsigned long long ab_prunes, unsigned long long static_prunes, int eval_score);
+void tui_set_predicted_sequence(const char *sequence);
+void tui_add_move(const char *move);
+void tui_get_input(char *buffer, int max_len);
+void tui_refresh_all(struct Piece board[8][8], enum Colour current_turn, const char *message, int is_ai_turn);
+void tui_show_message(const char *message);
+int tui_load_lichess_puzzle(const char *filename, enum Colour *puzzleTurnOut);
+void tui_start_puzzle(const char *expected_moves, const char *puzzle_id, int rating);
+int tui_validate_puzzle_move(const char *move_uci);
+const char* tui_get_puzzle_status(void);
+int tui_is_puzzle_active(void);
+const char* tui_get_next_puzzle_move(void);
+void tui_advance_puzzle_move(void);
+void tui_clear_move_history(void);
+
 // Additional utility / evaluation helpers
 int canBeCaptured(struct Piece currentBoard[8][8], int x, int y);
 int countMajorPieces(struct Piece board[8][8], enum Colour colour);

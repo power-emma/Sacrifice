@@ -337,26 +337,14 @@ int parseChessNotation(const char *notation, int *fromX, int *fromY, int *toX, i
 int getUserMove(enum Colour colour)
 {
     int fromX, fromY, toX, toY, promotionPiece;
-    char notation[20];
+    char notation[64];
 
-    printf("\n%s's turn. Enter move (e.g., e4, Nf3, Qxg4, e2e4, O-O for castling, or b1=Q for promotion): ",
-           (colour == WHITE) ? "White" : "Black");
-    fflush(stdout);
-
-    int result = scanf("%s", notation);
-    printf("[DEBUG] scanf returned: %d, notation='%s'\n", result, notation);
-    fflush(stdout);
-
-    if (result != 1)
-    {
-        printf("Failed to read input.\n");
-        return 0;
-    }
+    // Get input from TUI
+    tui_get_input(notation, sizeof(notation));
 
     // Parse chess notation
     if (!parseChessNotation(notation, &fromX, &fromY, &toX, &toY, colour, &promotionPiece))
     {
-        printf("Failed to parse chess notation.\n");
         return 0;
     }
 
@@ -393,11 +381,11 @@ int getUserMove(enum Colour colour)
             if (board[toX][toY].type == PAWN && promotionPiece != -1)
             {
                 board[toX][toY].type = promotionPiece;
-                printf("Pawn promoted to %s!\n",
-                       promotionPiece == QUEEN ? "Queen" : promotionPiece == ROOK ? "Rook"
-                                                       : promotionPiece == BISHOP ? "Bishop"
-                                                       : promotionPiece == KNIGHT ? "Knight"
-                                                                                  : "Unknown");
+            }
+            else if (board[toX][toY].type == PAWN && ((colour == WHITE && toY == 7) || (colour == BLACK && toY == 0)))
+            {
+                // Auto-promote to queen if not specified
+                promotePawn(board, toX, toY);
             }
 
             // Handle castling - move the rook
@@ -441,11 +429,28 @@ int getUserMove(enum Colour colour)
             // Record board state for threefold repetition detection
             recordBoardHistory();
 
-            printf("Move executed: %s\n", notation);
+            // Add move to TUI history
+            tui_add_move(notation);
+            
+            // Validate puzzle move if active
+            char move_uci[8];
+            snprintf(move_uci, sizeof(move_uci), "%c%d%c%d", 
+                     'a' + fromX, fromY + 1, 'a' + toX, toY + 1);
+            int puzzle_result = tui_validate_puzzle_move(move_uci);
+            
+            if (puzzle_result == -1) {
+                tui_show_message("PUZZLE COMPLETE! Well done!");
+            } else if (puzzle_result == 0 && puzzle_result != -1) {
+                // Only show failure message if validation actually happened
+                const char* status = tui_get_puzzle_status();
+                if (strstr(status, "FAILED") != NULL) {
+                    tui_show_message("Wrong move! Puzzle failed.");
+                }
+            }
+            
             return 1;
         }
     }
 
-    printf("Invalid move! That move is not in the list of legal moves.\n");
     return 0;
 }

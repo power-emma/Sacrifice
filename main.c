@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <sys/types.h>
+#include <ncurses.h>
 
 #include "chess.h"
 
@@ -17,169 +18,248 @@ int main()
 {
     boardSetup();
 
-    // First, ask whether to load a puzzle. If a puzzle is loaded,
-    char loadChoice = 'n';
+    // Initialize TUI
+    tui_init();
+    
+    // Show splash screen
+    tui_show_splash();
+    
     enum Colour aiColour = WHITE;
     enum Colour userColour = BLACK;
     enum Colour currentTurn = WHITE;
 
-    printf("Load a Lichess puzzle from 'lichess_db_puzzle.csv'? (y/n) [n]: ");
-    fflush(stdout);
-    if (scanf(" %c", &loadChoice) == 1 && (loadChoice == 'y' || loadChoice == 'Y'))
+    // Ask if user wants to load a puzzle
+    tui_refresh_all(board, currentTurn, "Load a Lichess puzzle? (y/n): ", 0);
+    char input[64];
+    tui_get_input(input, sizeof(input));
+    char loadChoice = input[0];
+    
+    if (loadChoice == 'y' || loadChoice == 'Y')
     {
-        // Puzzle test loop: repeatedly ask for puzzle number, run one AI response, compare, repeat
-        for (;;)
-        {
+        // Enter a persistent puzzle session loop: keep loading puzzles until user declines
+        while (1) {
             enum Colour puzzleTurn = WHITE;
-            struct LichessPuzzle puzzle;
-
-            if (!loadAndDisplayLichessPuzzle("lichess_db_puzzle.csv", &puzzleTurn, &puzzle))
-            {
-                printf("Failed to load puzzle. Try another? (y/n) [y]: ");
-                char tryAgain = 'y';
-                fflush(stdout);
-                if (scanf(" %c", &tryAgain) != 1 || (tryAgain != 'y' && tryAgain != 'Y'))
-                    break;
-                else
-                    continue;
+            if (!tui_load_lichess_puzzle("lichess_db_puzzle.csv", &puzzleTurn)) {
+                tui_show_message("Failed to load puzzle. Returning to main menu...");
+                break;
             }
 
-            // user plays the side-to-move from the puzzle; AI plays the opponent
-            userColour = puzzleTurn;
-            aiColour = (userColour == WHITE) ? BLACK : WHITE;
-
-            // Parse puzzle moves into tokens
-            char movesCopy[512];
-            strncpy(movesCopy, puzzle.moves, sizeof(movesCopy) - 1);
-            movesCopy[sizeof(movesCopy) - 1] = '\0';
-            char *tokens[128];
-            int tokenCount = 0;
-            char *t = strtok(movesCopy, " ");
-            while (t && tokenCount < 128)
-            {
-                tokens[tokenCount++] = t;
-                t = strtok(NULL, " ");
+            // Execute the first puzzle move (opponent's move that sets up the puzzle)
+            const char *firstMove = tui_get_next_puzzle_move();
+            if (firstMove && executeUciMove(board, firstMove)) {
+                tui_add_move(firstMove);
+                tui_advance_puzzle_move();
+                recordBoardHistory();
+                // Set current turn to solver side
+                currentTurn = (puzzleTurn == WHITE) ? BLACK : WHITE;
             }
 
-            // Reset board and load FEN for this puzzle (loadAndDisplayLichessPuzzle already loaded board)
-            if (tokenCount == 0)
-            {
-                printf("Puzzle has no moves listed.\n");
-            }
-            else
-            {
-                int allMatched = 1;
-                for (int idx = 0; idx < tokenCount; idx++)
-                {
-                    if (idx % 2 == 0)
-                    {
-                        // Puzzle (user) move
-                        const char *pMove = tokens[idx];
-                        if (!isLegalUciMove(board, userColour, pMove))
-                        {
-                            printf("Puzzle move '%s' is not legal in the current position. Aborting puzzle.\n", pMove);
-                            allMatched = 0;
+            // Ensure move history is clear for this new puzzle
+            tui_clear_move_history();
+
+            // Refresh display to show the puzzle position after opponent's move
+            tui_refresh_all(board, currentTurn, "Puzzle loaded! AI will solve it.", 0);
+            napms(500);
+
+            // In puzzle mode, AI solves the puzzle (plays both sides as needed)
+            userColour = -1; // No user interaction during puzzle session
+            aiColour = currentTurn; // AI starts as the solver side
+
+            // Play the puzzle until completion or failure
+            while (tui_is_puzzle_active()) {
+                if (currentTurn == aiColour) {
+                    tui_refresh_all(board, currentTurn, "AI thinking (puzzle mode)...", 1);
+                    moveRanking(board, depth, aiColour);
+                    // moveRanking will validate the AI move via tui_validate_puzzle_move()
+                    if (!tui_is_puzzle_active()) break; // failed
+                    currentTurn = (currentTurn == WHITE) ? BLACK : WHITE;
+                    napms(400);
+                } else {
+                    const char *nextMove = tui_get_next_puzzle_move();
+                    if (nextMove) {
+                        tui_refresh_all(board, currentTurn, "Opponent responds...", 1);
+                        if (executeUciMove(board, nextMove)) {
+                            tui_add_move(nextMove);
+                            tui_advance_puzzle_move();
+                            recordBoardHistory();
+                            currentTurn = (currentTurn == WHITE) ? BLACK : WHITE;
+                            napms(400);
+                        } else {
+                            tui_show_message("Failed to execute opponent move!");
                             break;
                         }
-                        if (!executeUciMove(board, pMove))
-                        {
-                            printf("Failed to execute puzzle move '%s'\n", pMove);
-                            allMatched = 0;
-                            break;
-                        }
-                        printf("Puzzle move played (by %s): %s\n", userColour == WHITE ? "White" : "Black", pMove);
-
-                        // If this was the last token, puzzle ends here (no AI reply expected)
-                        if (idx + 1 >= tokenCount)
-                        {
-                            printf("Puzzle concluded after last puzzle move.\n");
-                            break;
-                        }
-                    }
-                    else
-                    {
-                        // AI to move and expected reply is tokens[idx]
-                        const char *expected = tokens[idx];
-                        moveRanking(board, depth, aiColour);
-
-                        char aiMove[16] = "";
-                        if (lastMove.fromX >= 0)
-                        {
-                            snprintf(aiMove, sizeof(aiMove), "%c%d%c%d", 'a' + lastMove.fromX, lastMove.fromY + 1, 'a' + lastMove.toX, lastMove.toY + 1);
-                        }
-
-                        if (aiMove[0] != '\0' && strcmp(aiMove, expected) == 0)
-                        {
-                            printf("AI move matches puzzle best move: %s -> passed\n", aiMove);
-                        }
-                        else
-                        {
-                            printf("AI deviated from puzzle at reply %d.\n", idx);
-                            printf("  AI move : %s\n", aiMove[0] ? aiMove : "(none)");
-                            printf("  Best move: %s\n", expected);
-                            printf("  Puzzle moves sequence: %s\n", puzzle.moves);
-                            allMatched = 0;
-                            // continue through the rest of the sequence to fully conclude
-                        }
+                    } else {
+                        break; // no more opponent moves
                     }
                 }
-
-                if (allMatched)
-                    printf("AI followed the entire puzzle sequence -> PASSED.\n");
-                else
-                    printf("AI did not fully follow puzzle sequence.\n");
             }
 
-            // Ask whether to test another puzzle
-            char again = 'y';
-            printf("Test another puzzle? (y/n) [y]: ");
-            fflush(stdout);
-            if (scanf(" %c", &again) != 1 || (again != 'y' && again != 'Y'))
+            // Puzzle complete or failed; ask user whether to load another puzzle
+            tui_refresh_all(board, currentTurn, "Puzzle complete! Load another puzzle? (y/n): ", 0);
+            char pinput[64];
+            tui_get_input(pinput, sizeof(pinput));
+            if (pinput[0] == 'y' || pinput[0] == 'Y') {
+                // Reset board for next puzzle
+                boardSetup();
+                tui_clear_move_history();
+                // continue loop to load another puzzle
+                continue;
+            } else {
+                // Exit puzzle session and continue to normal game setup
                 break;
-
-            // Reset board for next puzzle
-            boardSetup();
+            }
         }
-    }
-    else
-    {
-        // No puzzle: ask user which color they want to play
-        char choice = 'w';
-        printf("Choose your color (w = White, b = Black) [w]: ");
-        fflush(stdout);
-        if (scanf(" %c", &choice) != 1)
-            choice = 'w';
+
+        // After puzzle session, fall through to ask which colour user wants
+        tui_refresh_all(board, currentTurn, "Exiting puzzle mode. Which colour would you like to play as? (w = White, b = Black): ", 0);
+        tui_get_input(input, sizeof(input));
+        char choice = input[0];
+
+        userColour = (choice == 'b' || choice == 'B') ? BLACK : WHITE;
+        aiColour = (userColour == WHITE) ? BLACK : WHITE;
+        currentTurn = WHITE;
+    } else {
+        // Ask user which color they want to play
+        tui_refresh_all(board, currentTurn, "Which colour would you like to play as? (w = White, b = Black): ", 0);
+        tui_get_input(input, sizeof(input));
+        char choice = input[0];
+        
         userColour = (choice == 'b' || choice == 'B') ? BLACK : WHITE;
         aiColour = (userColour == WHITE) ? BLACK : WHITE;
         currentTurn = WHITE;
     }
 
-    printf("Initial board:\n");
-    printBoard();
+    tui_refresh_all(board, currentTurn, "Game starting...", 0);
 
+    // Main game loop
     while (1)
     {
-        if (currentTurn == aiColour)
+        // Check if we're in puzzle mode
+        if (tui_is_puzzle_active())
         {
-            printf("\n=== AI's Turn (%s) ===\n", aiColour == WHITE ? "White" : "Black");
+            // AI's turn - it should find the correct puzzle move
+            if (currentTurn == aiColour)
+            {
+                tui_refresh_all(board, currentTurn, "AI thinking (puzzle mode)...", 1);
+                moveRanking(board, depth, aiColour);
+                
+                // moveRanking already validated the move via tui_validate_puzzle_move
+                // Check if puzzle done
+                if (!tui_is_puzzle_active()) {
+
+                    tui_refresh_all(board, currentTurn, "Puzzle Done, Load another? (y/n): ", 0);
+                    char input[64];
+                    tui_get_input(input, sizeof(input));
+                    
+                    if (input[0] == 'y' || input[0] == 'Y') {
+                        boardSetup();
+                        tui_clear_move_history();
+                        enum Colour puzzleTurn = WHITE;
+                        if (tui_load_lichess_puzzle("lichess_db_puzzle.csv", &puzzleTurn)) {
+                            const char *firstMove = tui_get_next_puzzle_move();
+                            if (firstMove && executeUciMove(board, firstMove)) {
+                                tui_add_move(firstMove);
+                                tui_advance_puzzle_move();
+                                recordBoardHistory();
+                                currentTurn = (puzzleTurn == WHITE) ? BLACK : WHITE;
+                            }
+                            tui_refresh_all(board, currentTurn, "New puzzle loaded! AI will solve.", 0);
+                            napms(500);
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                    continue;
+                }
+                
+                currentTurn = (currentTurn == WHITE) ? BLACK : WHITE;
+                napms(800);
+            }
+            // Opponent's response - execute expected move automatically
+            else
+            {
+                const char *nextMove = tui_get_next_puzzle_move();
+                if (nextMove)
+                {
+                    tui_refresh_all(board, currentTurn, "Opponent responds...", 1);
+                    
+                    if (executeUciMove(board, nextMove))
+                    {
+                        tui_add_move(nextMove);
+                        tui_advance_puzzle_move();
+                        recordBoardHistory();
+                        currentTurn = (currentTurn == WHITE) ? BLACK : WHITE;
+                        napms(800);
+                    }
+                    else
+                    {
+                        tui_show_message("Failed to execute opponent move!");
+                        break;
+                    }
+                }
+                else
+                {
+                    // No more moves - puzzle complete, ask for another
+                    tui_refresh_all(board, currentTurn, "Puzzle complete! Load another puzzle? (y/n): ", 0);
+                    char input[64];
+                    tui_get_input(input, sizeof(input));
+                    
+                    if (input[0] == 'y' || input[0] == 'Y')
+                    {
+                        // Reset board and load new puzzle
+                        boardSetup();
+                        tui_clear_move_history();
+                        enum Colour puzzleTurn = WHITE;
+                        if (tui_load_lichess_puzzle("lichess_db_puzzle.csv", &puzzleTurn)) {
+                            // Execute first move again
+                            const char *firstMove = tui_get_next_puzzle_move();
+                            if (firstMove && executeUciMove(board, firstMove)) {
+                                tui_add_move(firstMove);
+                                tui_advance_puzzle_move();
+                                recordBoardHistory();
+                                currentTurn = (puzzleTurn == WHITE) ? BLACK : WHITE;
+                            }
+                            tui_refresh_all(board, currentTurn, "New puzzle loaded! AI will solve.", 0);
+                            napms(500);
+                        } else {
+                            tui_show_message("Failed to load puzzle. Exiting...");
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        else if (currentTurn == aiColour)
+        {
+            tui_refresh_all(board, currentTurn, "AI is thinking...", 1);
             moveRanking(board, depth, aiColour);
-            printBoard();
+            
+            // Toggle turn after AI moves
+            currentTurn = (currentTurn == WHITE) ? BLACK : WHITE;
         }
         else
         {
-            printf("\n=== Your Turn (%s) ===\n", userColour == WHITE ? "White" : "Black");
+            tui_refresh_all(board, currentTurn, "Enter move (e.g., e4, Nf3, e2e4): ", 0);
             int validInput = 0;
             while (!validInput)
             {
                 validInput = getUserMove(userColour);
+                if (!validInput) {
+                    tui_refresh_all(board, currentTurn, "Invalid move! Try again: ", 0);
+                }
             }
-
-            printBoard();
+            
+            // Toggle turn after player moves
+            currentTurn = (currentTurn == WHITE) ? BLACK : WHITE;
         }
-
-        // Toggle turn
-        currentTurn = (currentTurn == WHITE) ? BLACK : WHITE;
     }
 
+    tui_cleanup();
     return 0;
 }

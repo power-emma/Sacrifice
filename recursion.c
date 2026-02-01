@@ -155,6 +155,8 @@ struct MoveSequence moveRankingRecursiveWithSequence(
             score += advancementBonus;
         }
 
+        
+
         if (score > best.score)
         {
             best.score = score;
@@ -177,6 +179,31 @@ struct MoveSequence moveRankingRecursiveWithSequence(
             abPruneCount++;
             break;
         }
+    }
+
+    /* If pruning/ordering left us with no selected move but there were legal
+       moves available, pick the first legal move as a fallback so the engine
+       doesn't return an invalid/no-move result. This prevents freezing when
+       everything was culled. */
+    if (best.count == 0 && moves.count > 0) {
+        struct Move m = moves.moves[0];
+        struct Piece tempBoard[8][8];
+        for (int x = 0; x < 8; x++)
+            for (int y = 0; y < 8; y++)
+                tempBoard[x][y] = board[x][y];
+
+        int fx = m.fromX, fy = m.fromY, tx = m.toX, ty = m.toY;
+        tempBoard[tx][ty] = tempBoard[fx][fy];
+        tempBoard[fx][fy].type = -1;
+        tempBoard[fx][fy].colour = -1;
+        tempBoard[tx][ty].hasMoved = 1;
+
+        /* Evaluate resulting position as a fallback score (respecting player
+           perspective). This is a cheap approximation instead of deeper search. */
+        int eval = evaluateBoardPosition(tempBoard);
+        best.score = (player == WHITE) ? eval : -eval;
+        best.count = 1;
+        best.moves[0] = m;
     }
 
     depth = oldDepth;
