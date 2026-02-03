@@ -28,9 +28,72 @@ int main()
     enum Colour userColour = BLACK;
     enum Colour currentTurn = WHITE;
 
-    // Ask if user wants to load a puzzle
-    tui_refresh_all(board, currentTurn, "Load a Lichess puzzle? (y/n): ", 0);
+    // Main menu loop
+    int menu_choice = 0;
     char input[64];
+    while (menu_choice == 0) {
+        erase();
+        
+        attron(COLOR_PAIR(7) | A_BOLD);
+        mvprintw(2, (COLS - 30) / 2, "SACRIFICE - MAIN MENU");
+        attroff(COLOR_PAIR(7) | A_BOLD);
+        
+        mvprintw(5, (COLS - 20) / 2, "Choose an option:");
+        mvprintw(7, 10, "(g) Play Game");
+        mvprintw(8, 10, "(p) Puzzle Test");
+        mvprintw(9, 10, "(t) Train Engine");
+        mvprintw(10, 10, "(q) Quit");
+        
+        mvprintw(12, 10, "Enter choice: ");
+        refresh();
+        
+        tui_get_input(input, sizeof(input));
+        char choice = input[0];
+        
+        switch (choice) {
+            case 'g':
+            case 'G':
+                // Game mode
+                tui_refresh_all(board, currentTurn, "Which colour would you like to play as? (w = White, b = Black): ", 0);
+                tui_get_input(input, sizeof(input));
+                char game_choice = input[0];
+                userColour = (game_choice == 'b' || game_choice == 'B') ? BLACK : WHITE;
+                aiColour = (userColour == WHITE) ? BLACK : WHITE;
+                currentTurn = WHITE;
+                menu_choice = 1;  // Exit menu, start game
+                break;
+                
+            case 'p':
+            case 'P':
+                // Puzzle test mode
+                tui_run_puzzle_test("lichess_db_puzzle.csv", depth);
+                menu_choice = 0;  // Return to menu
+                break;
+                
+            case 't':
+            case 'T':
+                // Training mode
+                tui_reconfigure_for_training();
+                tui_run_training_threaded("lichess_db_puzzle.csv", 50, 20, depth);
+                tui_init();  // Re-initialize normal display
+                menu_choice = 0;  // Return to menu
+                break;
+                
+            case 'q':
+            case 'Q':
+                // Quit
+                tui_cleanup();
+                return 0;
+                
+            default:
+                tui_show_message("Invalid choice. Try again.");
+                menu_choice = 0;
+                break;
+        }
+    }
+
+    // Ask if user wants to load a puzzle during game
+    tui_refresh_all(board, currentTurn, "Load a Lichess puzzle? (y/n): ", 0);
     tui_get_input(input, sizeof(input));
     char loadChoice = input[0];
     

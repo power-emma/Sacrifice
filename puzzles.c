@@ -4,6 +4,12 @@
 #include <string.h>
 #include "chess.h"
 
+// Empty stub for compatibility (not used in file-based loading)
+void closePuzzleFileCache(void)
+{
+    // No-op: file is opened and closed per puzzle load
+}
+
 // Loads a puzzle from the CSV file at the specified row number
 // Returns 1 on success, 0 on failure
 int loadLichessPuzzle(const char *filename, int puzzleNumber, struct LichessPuzzle *puzzle)

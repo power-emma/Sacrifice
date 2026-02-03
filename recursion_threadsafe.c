@@ -1,11 +1,11 @@
-// recursion.c - recursive search functions for move ranking
+// recursion_threadsafe.c - thread-safe recursive search functions for move ranking
 #include <stdio.h>
 #include <string.h>
 #include "chess.h"
 
-// Move Ranking Recursive Function with Move Sequence Tracking
-struct MoveSequence moveRankingRecursiveWithSequence(
-    struct Piece board[8][8],
+// Thread-safe Move Ranking Recursive Function with Move Sequence Tracking
+struct MoveSequence moveRankingRecursiveWithSequence_ThreadSafe(
+    struct GameState *state,
     int curDepth,
     int maxDepth,
     enum Colour player,
@@ -16,78 +16,78 @@ struct MoveSequence moveRankingRecursiveWithSequence(
     best.count = 0;
     best.score = -checkmate_score;
 
-    int oldDepth = depth;
-    depth = curDepth;
+    int oldDepth = state->depth;
+    state->depth = curDepth;
 
     // Checkmate and stalemate are game ending conditions, check first
 
     // If either side is checkmated in this position, return immediately with extreme score
-    if (isCheckmate(board, WHITE))
+    if (isCheckmate(state->board, WHITE))
     {
-        best.score = (player == WHITE) ? -checkmate_score : checkmate_score; // perspective relative to player
-        depth = oldDepth;
+        best.score = (player == WHITE) ? -checkmate_score : checkmate_score;
+        state->depth = oldDepth;
         return best;
     }
-    if (isCheckmate(board, BLACK))
+    if (isCheckmate(state->board, BLACK))
     {
-        best.score = (player == BLACK) ? -checkmate_score : checkmate_score; // perspective relative to player
-        depth = oldDepth;
+        best.score = (player == BLACK) ? -checkmate_score : checkmate_score;
+        state->depth = oldDepth;
         return best;
     }
 
     // Check for stalemate
-    if (isStalemate(board, WHITE))
+    if (isStalemate(state->board, WHITE))
     {
-        best.score = (player == WHITE) ? -stalemate_score : stalemate_score; // perspective relative to player
-        depth = oldDepth;
+        best.score = (player == WHITE) ? -stalemate_score : stalemate_score;
+        state->depth = oldDepth;
         return best;
     }
-    if (isStalemate(board, BLACK))
+    if (isStalemate(state->board, BLACK))
     {
-        best.score = (player == BLACK) ? -stalemate_score : stalemate_score; // perspective relative to player
-        depth = oldDepth;
+        best.score = (player == BLACK) ? -stalemate_score : stalemate_score;
+        state->depth = oldDepth;
         return best;
     }
 
     // Check for threefold repetition (draw)
-    if (countBoardRepetitions() >= 3)
+    if (countBoardRepetitions_ThreadSafe(state) >= 3)
     {
         best.score = 0; // Draw - neutral score
-        depth = oldDepth;
+        state->depth = oldDepth;
         return best;
     }
 
     // Check for 50-move rule (draw)
-    if (halfmoveClock >= 100)
+    if (state->halfmoveClock >= 100)
     {
         best.score = 0; // Draw - neutral score
-        depth = oldDepth;
+        state->depth = oldDepth;
         return best;
     }
 
     // Allow deeper search in endgame positions
     int effectiveMaxDepth = maxDepth;
-    if (isInEndgame(board))
+    if (isInEndgame(state->board))
     {
-        effectiveMaxDepth += 0; /* increase recursion depth by 4 in endgame */
+        effectiveMaxDepth += 0; /* increase recursion depth by N in endgame */
     }
 
     // Recursion base case
     if (curDepth >= effectiveMaxDepth)
     {
-        double eval = evaluateBoardPosition(board);
+        double eval = evaluateBoardPosition_ThreadSafe(state);
         best.score = (player == WHITE) ? eval : -eval;
-        depth = oldDepth;
+        state->depth = oldDepth;
         return best;
     }
 
-    struct MoveList moves = validMoves(board, player);
+    struct MoveList moves = validMoves(state->board, player);
 
     if (moves.count == 0)
     {
-        double eval = evaluateBoardPosition(board);
+        double eval = evaluateBoardPosition_ThreadSafe(state);
         best.score = (player == WHITE) ? eval : -eval;
-        depth = oldDepth;
+        state->depth = oldDepth;
         return best;
     }
 
@@ -97,7 +97,7 @@ struct MoveSequence moveRankingRecursiveWithSequence(
 
         for (int x = 0; x < 8; x++)
             for (int y = 0; y < 8; y++)
-                tempBoard[x][y] = board[x][y];
+                tempBoard[x][y] = state->board[x][y];
 
         int fx = moves.moves[i].fromX;
         int fy = moves.moves[i].fromY;
@@ -129,33 +129,44 @@ struct MoveSequence moveRankingRecursiveWithSequence(
         }
 
         // Static (shallow) futility pruning
-        double staticEval = evaluateBoardPosition(tempBoard);
+        // Create temporary state for evaluation
+        struct GameState tempState = *state;
+        memcpy(tempState.board, tempBoard, sizeof(tempBoard));
+        
+        double staticEval = evaluateBoardPosition_ThreadSafe(&tempState);
         double staticScore = (player == WHITE) ? staticEval : -staticEval;
         if (best.score > -checkmate_score && staticScore < best.score - static_futility_prune_margin)
         {
-            staticPruneCount++;
+            state->staticPruneCount++;
             continue; // skip recursion for this move
         }
 
+        // Recurse with modified board
+        memcpy(tempState.board, tempBoard, sizeof(tempBoard));
+        
         struct MoveSequence child =
-            moveRankingRecursiveWithSequence(
-                tempBoard,
+            moveRankingRecursiveWithSequence_ThreadSafe(
+                &tempState,
                 curDepth + 1,
                 maxDepth,
                 player == WHITE ? BLACK : WHITE,
                 -beta,
                 -alpha);
 
+        // Propagate statistics back to parent state
+        state->evalCount = tempState.evalCount;
+        state->ttHitCount = tempState.ttHitCount;
+        state->abPruneCount = tempState.abPruneCount;
+        state->staticPruneCount = tempState.staticPruneCount;
+
         double score = -child.score;
 
         // Apply endgame advancement bonus at depth 0 (immediate move evaluation)
-        if (depth == 0)
+        if (state->depth == 0)
         {
-            int advancementBonus = evaluateEndgameAdvancement(board, fx, fy, tx, ty, player);
+            int advancementBonus = evaluateEndgameAdvancement(state->board, fx, fy, tx, ty, player);
             score += advancementBonus;
         }
-
-        
 
         if (score > best.score)
         {
@@ -175,22 +186,20 @@ struct MoveSequence moveRankingRecursiveWithSequence(
         // Alpha-beta prune
         if (alpha >= beta)
         {
-            /* Count this prune occurrence */
-            abPruneCount++;
+            state->abPruneCount++;
             break;
         }
     }
 
-    /* If pruning/ordering left us with no selected move but there were legal
-       moves available, pick the first legal move as a fallback so the engine
-       doesn't return an invalid/no-move result. This prevents freezing when
-       everything was culled. */
-    if (best.count == 0 && moves.count > 0) {
+    // If pruning/ordering left us with no selected move but there were legal
+    //   moves available, pick the first legal move as a fallback 
+    if (best.count == 0 && moves.count > 0)
+    {
         struct Move m = moves.moves[0];
         struct Piece tempBoard[8][8];
         for (int x = 0; x < 8; x++)
             for (int y = 0; y < 8; y++)
-                tempBoard[x][y] = board[x][y];
+                tempBoard[x][y] = state->board[x][y];
 
         int fx = m.fromX, fy = m.fromY, tx = m.toX, ty = m.toY;
         tempBoard[tx][ty] = tempBoard[fx][fy];
@@ -198,14 +207,29 @@ struct MoveSequence moveRankingRecursiveWithSequence(
         tempBoard[fx][fy].colour = -1;
         tempBoard[tx][ty].hasMoved = 1;
 
-        /* Evaluate resulting position as a fallback score (respecting player
-           perspective). This is a cheap approximation instead of deeper search. */
-        double eval = evaluateBoardPosition(tempBoard);
+        struct GameState tempState = *state;
+        memcpy(tempState.board, tempBoard, sizeof(tempBoard));
+        double eval = evaluateBoardPosition_ThreadSafe(&tempState);
         best.score = (player == WHITE) ? eval : -eval;
         best.count = 1;
         best.moves[0] = m;
     }
 
-    depth = oldDepth;
+    state->depth = oldDepth;
     return best;
+}
+
+// Top-level thread-safe function to compute best move
+struct MoveSequence computeBestMove_ThreadSafe(struct GameState *state, int maxRecursiveDepth, enum Colour aiColour)
+{
+    // Reset evaluation statistics
+    state->evalCount = 0ULL;
+    state->ttHitCount = 0ULL;
+    state->abPruneCount = 0ULL;
+    state->staticPruneCount = 0ULL;
+
+    struct MoveSequence bestSequence = moveRankingRecursiveWithSequence_ThreadSafe(
+        state, 0, maxRecursiveDepth, aiColour, -checkmate_score, checkmate_score);
+
+    return bestSequence;
 }
