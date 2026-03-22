@@ -82,76 +82,6 @@ struct MoveSequence
     double score;
 };
 
-// Reward parameters structure (from training.c)
-typedef struct {
-    // Development and Piece Positioning
-    double development_penalty_per_move;
-    double global_position_table_scale;
-    double knight_backstop_penalty;
-    double knight_edge_penalty;
-    double slider_mobility_per_square;
-    
-    // Pawn Evaluation
-    double undefended_central_pawn_penalty;
-    double central_pawn_bonus;
-    double pawn_promotion_immediate_bonus;
-    double pawn_promotion_immediate_distance;
-    double pawn_promotion_delayed_bonus;
-    double pawn_promotion_delayed_distance;
-    
-    // King Safety and Castling
-    double king_hasmoved_penalty;
-    double king_center_exposure_penalty;
-    double castling_bonus;
-    double king_adjacent_attack_bonus;
-    
-    // Tactical (Pieces Under Attack)
-    double defended_piece_support_bonus;
-    double defended_piece_weaker_penalty;
-    double undefended_piece_penalty;
-    
-    // Check and Stalemate
-    double check_penalty_white;
-    double check_bonus_black;
-    double stalemate_black_penalty;
-    double stalemate_white_penalty;
-    
-    // Endgame King Island
-    double endgame_king_island_max_norm;
-    double endgame_king_island_bonus_scale;
-    
-    // Search Pruning and Evaluation
-    double static_futility_prune_margin;
-    double checkmate_score;
-    double stalemate_score;
-    double draw_score;
-    
-    // Piece-Square Tables (all 448 values)
-    double pawn_pst[8][8];
-    double knight_pst[8][8];
-    double bishop_pst[8][8];
-    double rook_pst[8][8];
-    double queen_pst[8][8];
-    double king_pst_mg[8][8];
-    double king_pst_eg[8][8];
-    
-    // Move Offset Score Tables
-    double pawn_move_scores[4];      // forward1, forward2, capture_left, capture_right
-    double knight_move_scores[8];    // 8 L-shaped moves
-    double bishop_move_scores[4];    // 4 diagonal directions
-    double rook_move_scores[4];      // 4 orthogonal directions
-    double queen_move_scores[8];     // 8 directions
-    double king_move_scores[8];      // 8 directions
-    
-    // Move Distance Score Tables
-    double pawn_move_distance_scores[2];     // 1 or 2 squares
-    double knight_move_distance_scores[8];   // 8 moves (fixed distance)
-    double bishop_move_distance_scores[7];   // 1-7 squares
-    double rook_move_distance_scores[7];     // 1-7 squares
-    double queen_move_distance_scores[7];    // 1-7 squares
-    double king_move_distance_scores[1];     // 1 square (fixed)
-} RewardParams;
-
 // Helper to initialize GameState
 void initGameState(struct GameState *state);
 void cleanupGameState(struct GameState *state);
@@ -185,6 +115,15 @@ int playPuzzles1To100(const char *filename, int searchDepth);
 int playPuzzlesMultiThreaded(const char *filename, int searchDepth, int numPuzzles, int numThreads,
                               void (*progress_callback)(int, int, int));
 int playPuzzles1To100_MultiThreaded(const char *filename, int searchDepth, int numThreads);
+
+// Multi-threaded NN training via teacher forcing on puzzle positions
+// Each AI-turn position is used as one gradient step: input=current board, target=correct-move board.
+// Weights are auto-saved to nn_weights.bin after each call.
+// Returns the number of puzzles where the NN predicted the correct first move.
+int playPuzzlesMultiThreaded_Train(const char *filename, float learning_rate,
+                                   int numPuzzles, int numThreads,
+                                   void (*progress_callback)(int, int, int));
+int playPuzzles1To100_MT_Train(const char *filename, float learning_rate, int numThreads);
 
 // Callback for puzzle progress during testing (can be NULL)
 extern void (*puzzle_progress_callback)(int puzzles_completed, int total_puzzles, int current_score);
@@ -229,31 +168,10 @@ int canBeCaptured(struct Piece currentBoard[8][8], int x, int y);
 int countMajorPieces(struct Piece board[8][8], enum Colour colour);
 int squareDistance(int x1, int y1, int x2, int y2);
 
-// Recursion: move-ranking recursive function (thread-safe version)
-struct MoveSequence moveRankingRecursiveWithSequence_ThreadSafe(
-    struct GameState *state,
-    int curDepth,
-    int maxDepth,
-    enum Colour player,
-    double alpha,
-    double beta);
-
-// Legacy version for non-threaded code
-struct MoveSequence moveRankingRecursiveWithSequence(
-    struct Piece board[8][8],
-    int depth,
-    int maxDepth,
-    enum Colour player,
-    double alpha,
-    double beta);
-
-// Top-level move ranking: runs recursive search and executes best move on board
+// Top-level move ranking: runs NN and executes best move on board
 int moveRanking(struct Piece currentBoard[8][8], int maxRecursiveDepth, enum Colour aiColour);
 
-// Thread-safe version that only computes best move without modifying global state
-struct MoveSequence computeBestMove_ThreadSafe(struct GameState *state, int maxRecursiveDepth, enum Colour aiColour);
-
-// Helpers and globals used by recursive search
+// Helpers and globals used by search
 int countBoardRepetitions_ThreadSafe(struct GameState *state);
 int countBoardRepetitions();
 void recordBoardHistory_ThreadSafe(struct GameState *state);
@@ -273,76 +191,26 @@ extern unsigned long long abPruneCount; // alpha-beta prune count
 extern unsigned long long staticPruneCount; // static-futility prune count
 void printEvaluationCount(void);
 
-// === Reward/Penalty Tuning Constants (defined in rewards.c) ===
-extern double development_penalty_per_move;
-extern double global_position_table_scale;
-extern double knight_backstop_penalty;
-extern double knight_edge_penalty;
-extern double slider_mobility_per_square;
-extern double undefended_central_pawn_penalty;
-extern double central_pawn_bonus;
-extern double pawn_promotion_immediate_bonus;
-extern double pawn_promotion_immediate_distance;
-extern double pawn_promotion_delayed_bonus;
-extern double pawn_promotion_delayed_distance;
-extern double king_hasmoved_penalty;
-extern double king_center_exposure_penalty;
-extern double castling_bonus;
-extern double king_adjacent_attack_bonus;
-extern double defended_piece_support_bonus;
-extern double defended_piece_weaker_penalty;
-extern double undefended_piece_penalty;
-extern double check_penalty_white;
-extern double check_bonus_black;
-extern double stalemate_black_penalty;
-extern double stalemate_white_penalty;
-extern double endgame_king_island_max_norm;
-extern double endgame_king_island_bonus_scale;
-extern double static_futility_prune_margin;
-extern double checkmate_score;
-extern double stalemate_score;
-extern double draw_score;
-
-// === Piece-Square Tables (PST) ===
-extern double pawn_pst[8][8];
-extern double pawn_pst_scale;
-extern double knight_pst[8][8];
-extern double knight_pst_scale;
-extern double bishop_pst[8][8];
-extern double bishop_pst_scale;
-extern double rook_pst[8][8];
-extern double rook_pst_scale;
-extern double queen_pst[8][8];
-extern double queen_pst_scale;
-extern double king_pst_mg[8][8];  // Middlegame king
-extern double king_pst_mg_scale;
-extern double king_pst_eg[8][8];  // Endgame king
-extern double king_pst_eg_scale;
-
 // Suppress engine output during puzzle testing
 extern int suppress_engine_output;
 
 // Checkmate message buffer for puzzle testing
 extern char last_checkmate_message[256];
 
-// === Training System (defined in training.c) ===
+// Per-iteration training record (used by training display)
 typedef struct {
     int iteration;
     int score;
     int pass_count;
 } IterationHistory;
 
-int train_rewards(int iterations, int search_depth);
-int train_rewards_threaded(int iterations, int num_threads, int search_depth);
-
 // === Training TUI (defined in tui.c) ===
-void tui_update_training_display(int iteration, int score, int best_score, int best_iteration, double mutation_rate, int is_new_record, int pass_count, IterationHistory *last_5, int history_count, const RewardParams *best_params, int elapsed_seconds, const RewardParams *top5_params, const int *top5_scores, int top5_count);
 void tui_show_training_complete(int best_score, int total_iterations);
-void tui_run_training(const char *puzzle_file, int iterations, int search_depth);
+void tui_nn_training_display(int iteration, int total_iterations, int score,
+                             int best_score, int best_iteration,
+                             IterationHistory *last_5, int history_count,
+                             int elapsed_seconds, float learning_rate);
 void tui_run_training_threaded(const char *puzzle_file, int iterations, int num_threads, int search_depth);
-
-// === Training State Access (defined in training.c) ===
-int get_training_current_puzzle(void);  // Get current puzzle number during training
 
 // === Evaluation System ===
 void clear_thread_transposition_table(void);  // Clear thread-local TT between puzzles

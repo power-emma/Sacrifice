@@ -4,21 +4,40 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <time.h>
 #include <pthread.h>
 #include "chess.h"
+#include "nn.h"
 
 // Mutex for thread-safe ncurses access
 static pthread_mutex_t tui_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Hash function for parameter sets
-static uint32_t hash_params(const RewardParams *params) {
-    uint32_t hash = 5381;
-    const unsigned char *bytes = (const unsigned char *)params;
-    size_t size = sizeof(RewardParams);
-    for (size_t i = 0; i < size; i++) {
-        hash = ((hash << 5) + hash) ^ bytes[i];
-    }
-    return hash;
+// Context shared between tui_run_training_threaded and the live progress callback
+typedef struct {
+    int iteration;
+    int total_iterations;
+    int best_score;
+    int best_iteration;
+    IterationHistory last_5[5];
+    int history_count;
+    struct timespec t_start;
+    float learning_rate;
+} TrainingDisplayCtx;
+
+static TrainingDisplayCtx g_train_ctx;
+
+// Called every 5 puzzles by worker threads — updates display while threads run
+static void training_progress_cb(int completed, int total, int passes)
+{
+    (void)completed; (void)total;
+    struct timespec t_now;
+    clock_gettime(CLOCK_MONOTONIC, &t_now);
+    int elapsed = (int)(t_now.tv_sec - g_train_ctx.t_start.tv_sec);
+    tui_nn_training_display(
+        g_train_ctx.iteration, g_train_ctx.total_iterations,
+        passes, g_train_ctx.best_score, g_train_ctx.best_iteration,
+        g_train_ctx.last_5, g_train_ctx.history_count,
+        elapsed, g_train_ctx.learning_rate);
 }
 
 // Color pairs
@@ -1144,211 +1163,168 @@ void tui_run_puzzle_test(const char *filename, int searchDepth)
 // TRAINING SYSTEM TUI DISPLAY
 // ============================================================================
 
-// Update training display in TUI using separate windows
-void tui_update_training_display(int iteration, int score, int best_score, int best_iteration, double mutation_rate, int is_new_record __attribute__((unused)), int pass_count, IterationHistory *last_5, int history_count, const RewardParams *best_params, int elapsed_seconds, const RewardParams *top5_params, const int *top5_scores, int top5_count)
+// Update training display — called after each iteration
+void tui_nn_training_display(int iteration, int total_iterations, int score,
+                             int best_score, int best_iteration,
+                             IterationHistory *last_5, int history_count,
+                             int elapsed_seconds, float learning_rate)
 {
-    // Lock for thread-safe ncurses access
     pthread_mutex_lock(&tui_mutex);
-    
-    // Clear and setup stats window (left column)
+
+    // --- Left column: current status ---
     werase(stats_win);
     draw_fancy_border(stats_win, "TRAINING STATUS");
-    
+
     int y = 2;
     wattron(stats_win, COLOR_PAIR(COLOR_INFO));
-    mvwprintw(stats_win, y++, 2, "Iteration: %d", iteration);
-    mvwprintw(stats_win, y++, 2, "Puzzle: %d/%d", get_training_current_puzzle(), PUZZLE_TEST_COUNT);
-    mvwprintw(stats_win, y++, 2, "Current: %d/%d", score, PUZZLE_TEST_COUNT);
-    mvwprintw(stats_win, y++, 2, "Best: %d/%d", best_score, PUZZLE_TEST_COUNT);
-    mvwprintw(stats_win, y++, 2, "Mutation: %.1f", mutation_rate);
-    
-    // Algorithm state
+    mvwprintw(stats_win, y++, 2, "Iteration: %d / %d", iteration, total_iterations);
+    mvwprintw(stats_win, y++, 2, "Puzzles:   %d", PUZZLE_TEST_COUNT);
+    mvwprintw(stats_win, y++, 2, "Score:     %d / %d", score, PUZZLE_TEST_COUNT);
+    mvwprintw(stats_win, y++, 2, "Best:      %d / %d", best_score, PUZZLE_TEST_COUNT);
+    mvwprintw(stats_win, y++, 2, "Best iter: %d", best_iteration);
     y++;
-    wattron(stats_win, COLOR_PAIR(COLOR_HIGHLIGHT));
-    mvwprintw(stats_win, y++, 2, "State:");
-    wattroff(stats_win, COLOR_PAIR(COLOR_HIGHLIGHT));
-    
-    const char *state_msg = "Broad Explore";
-    if (mutation_rate < 20) state_msg = "Converge";
-    if (mutation_rate < 10) state_msg = "Fine Tune";
-    if (mutation_rate < 2) state_msg = "Refine";
-    
-    mvwprintw(stats_win, y++, 2, "%s", state_msg);
+    mvwprintw(stats_win, y++, 2, "LR:        %.5f", (double)learning_rate);
     wattroff(stats_win, COLOR_PAIR(COLOR_INFO));
-    
-    wrefresh(stats_win);
-    
-    // Clear and setup best line window (middle column) - now shows top 5
-    werase(best_line_win);
-    draw_fancy_border(best_line_win, "TOP 5 SCORES");
-    
-    y = 2;
-    wattron(best_line_win, COLOR_PAIR(COLOR_SUCCESS) | A_BOLD);
-    mvwprintw(best_line_win, y, 2, "Best Leaders:");
-    wattroff(best_line_win, COLOR_PAIR(COLOR_SUCCESS) | A_BOLD);
-    
-    // Display top 5 scores
-    for (int i = 0; i < top5_count && i < 5; i++) {
-        wattron(best_line_win, COLOR_PAIR(COLOR_SUCCESS));
-        mvwprintw(best_line_win, y++, 2, "#%d: %d/%d (%.0f%%)", i+1, top5_scores[i], PUZZLE_TEST_COUNT,
-                  (top5_scores[i] / (double)PUZZLE_TEST_COUNT) * 100.0);
-        wattroff(best_line_win, COLOR_PAIR(COLOR_SUCCESS));
-    }
-    
-    y++;
-    wattron(best_line_win, COLOR_PAIR(COLOR_HIGHLIGHT));
-    wattroff(best_line_win, COLOR_PAIR(COLOR_HIGHLIGHT));
 
-  
-    
-    // Format and display elapsed time
-    int hours = elapsed_seconds / 3600;
+    // Progress bar
+    if (total_iterations > 0) {
+        int bar_w = 20;
+        int filled = (iteration * bar_w) / total_iterations;
+        wattron(stats_win, COLOR_PAIR(COLOR_HIGHLIGHT));
+        mvwprintw(stats_win, y++, 2, "Progress:");
+        wattroff(stats_win, COLOR_PAIR(COLOR_HIGHLIGHT));
+        wmove(stats_win, y, 2);
+        wattron(stats_win, COLOR_PAIR(COLOR_SUCCESS));
+        for (int i = 0; i < filled; i++) waddch(stats_win, ACS_BLOCK);
+        wattroff(stats_win, COLOR_PAIR(COLOR_SUCCESS));
+        wattron(stats_win, COLOR_PAIR(COLOR_INFO));
+        for (int i = filled; i < bar_w; i++) waddch(stats_win, '-');
+        wattroff(stats_win, COLOR_PAIR(COLOR_INFO));
+    }
+    wrefresh(stats_win);
+
+    // --- Middle column: elapsed time + accuracy ---
+    werase(best_line_win);
+    draw_fancy_border(best_line_win, "PERFORMANCE");
+
+    y = 2;
+    int hours   = elapsed_seconds / 3600;
     int minutes = (elapsed_seconds % 3600) / 60;
     int seconds = elapsed_seconds % 60;
-    if (hours > 0) {
+    wattron(best_line_win, COLOR_PAIR(COLOR_INFO));
+    if (hours > 0)
         mvwprintw(best_line_win, y++, 2, "Elapsed: %dh %dm %ds", hours, minutes, seconds);
-    } else if (minutes > 0) {
+    else if (minutes > 0)
         mvwprintw(best_line_win, y++, 2, "Elapsed: %dm %ds", minutes, seconds);
-    } else {
+    else
         mvwprintw(best_line_win, y++, 2, "Elapsed: %ds", seconds);
-    }
-    
+
+    y++;
+    double accuracy = (PUZZLE_TEST_COUNT > 0) ? (score * 100.0 / PUZZLE_TEST_COUNT) : 0.0;
+    double best_acc  = (PUZZLE_TEST_COUNT > 0) ? (best_score * 100.0 / PUZZLE_TEST_COUNT) : 0.0;
+    mvwprintw(best_line_win, y++, 2, "Accuracy:  %.1f%%", accuracy);
+    mvwprintw(best_line_win, y++, 2, "Best acc:  %.1f%%", best_acc);
+    wattroff(best_line_win, COLOR_PAIR(COLOR_INFO));
     wrefresh(best_line_win);
-    
-    // Clear and setup moves window (right column)
+
+    // --- Right column: last-5 iteration history ---
     werase(moves_win);
     draw_fancy_border(moves_win, "ITERATIONS");
-    
+
     y = 2;
     wattron(moves_win, COLOR_PAIR(COLOR_SUCCESS) | A_BOLD);
-    mvwprintw(moves_win, y++, 2, ">>> %3d: %d/%d", iteration, pass_count, PUZZLE_TEST_COUNT);
+    mvwprintw(moves_win, y++, 2, ">>> %3d: %d/%d (%.0f%%)",
+              iteration, score, PUZZLE_TEST_COUNT, accuracy);
     wattroff(moves_win, COLOR_PAIR(COLOR_SUCCESS) | A_BOLD);
-    
-    for (int i = 0; i < history_count && y < 9; i++)
-    {
-        wattron(moves_win, COLOR_PAIR(COLOR_INFO));
-        mvwprintw(moves_win, y++, 2, "    %3d: %d/%d", 
-                  last_5[i].iteration,
-                  last_5[i].pass_count,
-                  PUZZLE_TEST_COUNT);
-        wattroff(moves_win, COLOR_PAIR(COLOR_INFO));
+
+    for (int i = 0; i < history_count; i++) {
+        double h_acc = (PUZZLE_TEST_COUNT > 0)
+            ? (last_5[i].pass_count * 100.0 / PUZZLE_TEST_COUNT) : 0.0;
+        int color = (last_5[i].pass_count == best_score) ? COLOR_SUCCESS : COLOR_INFO;
+        wattron(moves_win, COLOR_PAIR(color));
+        mvwprintw(moves_win, y++, 2, "    %3d: %d/%d (%.0f%%)",
+                  last_5[i].iteration, last_5[i].pass_count,
+                  PUZZLE_TEST_COUNT, h_acc);
+        wattroff(moves_win, COLOR_PAIR(color));
     }
-    
     wrefresh(moves_win);
-    
-    // Clear and setup stats params window (left column, below stats)
+
+    // --- Lower-left: NN weight file info ---
     werase(stats_params_win);
-    draw_fancy_border(stats_params_win, "CURRENT PARAMS");
-    
+    draw_fancy_border(stats_params_win, "NN INFO");
+
     y = 2;
+    const char *backend = "CPU";
+#ifdef USE_CUDA
+    backend = nn_gpu_is_ready() ? "GPU" : "CPU";
+#endif
+
     wattron(stats_params_win, COLOR_PAIR(COLOR_INFO));
-    mvwprintw(stats_params_win, y++, 2, "0x%02x %02x %02x %02x %02x", 
-              development_penalty_per_move, global_position_table_scale,
-              knight_backstop_penalty, knight_edge_penalty, slider_mobility_per_square);
-    mvwprintw(stats_params_win, y++, 2, "0x%02x %02x %02x %02x %02x",
-              undefended_central_pawn_penalty, central_pawn_bonus,
-              pawn_promotion_immediate_bonus, pawn_promotion_immediate_distance,
-              pawn_promotion_delayed_bonus);
-    mvwprintw(stats_params_win, y++, 2, "0x%02x %02x %02x %02x %02x",
-              pawn_promotion_delayed_distance, king_hasmoved_penalty,
-              king_center_exposure_penalty, castling_bonus, king_adjacent_attack_bonus);
-    mvwprintw(stats_params_win, y++, 2, "0x%02x %02x %02x %02x %02x",
-              defended_piece_support_bonus, defended_piece_weaker_penalty,
-              undefended_piece_penalty, check_penalty_white, check_bonus_black);
-    mvwprintw(stats_params_win, y++, 2, "0x%02x %02x %02x %02x %02x",
-              stalemate_black_penalty, stalemate_white_penalty,
-              endgame_king_island_max_norm, endgame_king_island_bonus_scale,
-              static_futility_prune_margin);
+    mvwprintw(stats_params_win, y++, 2, "Network: 832 x 832 dense");
+    mvwprintw(stats_params_win, y++, 2, "Backend: %s", backend);
+    mvwprintw(stats_params_win, y++, 2, "Weights: nn_weights.bin");
+    mvwprintw(stats_params_win, y++, 2, "Inputs:  64 sq x 13 cats");
+    mvwprintw(stats_params_win, y++, 2, "Loss:    MSE (teacher forcing)");
+    mvwprintw(stats_params_win, y++, 2, "Optim:   SGD");
     wattroff(stats_params_win, COLOR_PAIR(COLOR_INFO));
-    
     wrefresh(stats_params_win);
-    
-    // Clear and setup best params window (middle column, below best_line)
+
+    // --- Lower-middle: best scores so far ---
     werase(best_params_win);
-    draw_fancy_border(best_params_win, "TOP 5 BEST PARAMS");
-    
+    draw_fancy_border(best_params_win, "BEST SCORE");
+
     y = 2;
-    for (int i = 0; i < top5_count && i < 5; i++) {
-        
-        int color = COLOR_SUCCESS;
-        if (i == 1) color = COLOR_INFO;  // second best in cyan
-        
-        wattron(best_params_win, COLOR_PAIR(color));
-        uint32_t param_hash = hash_params(&top5_params[i]);
-        mvwprintw(best_params_win, y++, 2, "#%d (%d/500): 0x%08x", i+1, top5_scores[i], param_hash);
-        wattroff(best_params_win, COLOR_PAIR(color));
-    }
-    
+    wattron(best_params_win, COLOR_PAIR(COLOR_SUCCESS) | A_BOLD);
+    mvwprintw(best_params_win, y++, 2, "%d / %d  (%.1f%%)",
+              best_score, PUZZLE_TEST_COUNT, best_acc);
+    wattroff(best_params_win, COLOR_PAIR(COLOR_SUCCESS) | A_BOLD);
+    wattron(best_params_win, COLOR_PAIR(COLOR_INFO));
+    mvwprintw(best_params_win, y++, 2, "at iteration %d", best_iteration);
+    wattroff(best_params_win, COLOR_PAIR(COLOR_INFO));
     wrefresh(best_params_win);
-    
-    // Clear and setup info window (bottom) - for thread status
+
+    // --- Bottom: thread status ---
     werase(info_win);
-    draw_fancy_border(info_win, "THREAD STATUS (Parallel)");
-    
+    draw_fancy_border(info_win, "THREAD STATUS");
+
     y = 2;
-    int thread_statuses[512];  // Support up to 256 threads (256 * 2 values)
+    int thread_statuses[512];
     int num_threads = 0;
     get_thread_puzzle_statuses(&num_threads, thread_statuses);
-    
-    if (num_threads > 0)
-    {
+
+    if (num_threads > 0) {
         int max_y_info, max_x_info;
         getmaxyx(info_win, max_y_info, max_x_info);
-        
-        // Calculate threads per row based on window width
-        // Each thread entry is "T##:[##]X" = 9 characters + 2 spaces = 11 chars per thread
         int thread_entry_width = 11;
         int threads_per_row = (max_x_info - 4) / thread_entry_width;
-        if (threads_per_row < 1) threads_per_row = 1;  // Minimum 1 per row
-        
-        for (int i = 0; i < num_threads && y < max_y_info - 1; i++)
-        {
+        if (threads_per_row < 1) threads_per_row = 1;
+
+        for (int i = 0; i < num_threads && y < max_y_info - 1; i++) {
             int puzzle_idx = thread_statuses[i * 2];
-            int result = thread_statuses[i * 2 + 1];
-            
+            int result     = thread_statuses[i * 2 + 1];
+
             const char *status_char = "-";
             int color = COLOR_INFO;
-            
-            if (result == 1)
-            {
-                status_char = "!";
-                color = COLOR_SUCCESS;
-            }
-            else if (result == 0)
-            {
-                status_char = "X";
-                color = COLOR_WARNING;
-            }
-            
+            if (result == 1) { status_char = "!"; color = COLOR_SUCCESS; }
+            else if (result == 0) { status_char = "X"; color = COLOR_WARNING; }
+
             int col = 2 + (i % threads_per_row) * thread_entry_width;
-            
             wattron(info_win, COLOR_PAIR(color));
             if (puzzle_idx >= 0)
-            {
                 mvwprintw(info_win, y, col, "T%02d:[%3d]%s", i, puzzle_idx, status_char);
-            }
             else
-            {
                 mvwprintw(info_win, y, col, "T%02d: idle", i);
-            }
-            
-            if ((i + 1) % threads_per_row == 0)
-                y++;
+            if ((i + 1) % threads_per_row == 0) y++;
             wattroff(info_win, COLOR_PAIR(color));
         }
-    }
-    else
-    {
-        // No threads active - show message
+    } else {
         wattron(info_win, COLOR_PAIR(COLOR_INFO));
-        mvwprintw(info_win, y, 2, "No active threads (waiting for puzzle test to start...)");
+        mvwprintw(info_win, y, 2, "No active threads");
         wattroff(info_win, COLOR_PAIR(COLOR_INFO));
     }
-    
     wrefresh(info_win);
-    napms(50);
-    
-    // Unlock ncurses access
+
+    napms(30);
     pthread_mutex_unlock(&tui_mutex);
 }
 
@@ -1399,193 +1375,176 @@ void tui_show_training_complete(int best_score, int total_iterations)
     getch();
 }
 
-// Training interface function with TUI display
-void tui_run_training(const char *puzzle_file, int iterations, int search_depth)
-{
-    (void)puzzle_file;  // Parameter reserved for future use
-    
-    int max_y, max_x;
-    getmaxyx(main_win, max_y, max_x);
-    
-    // Show initial training screen
-    werase(main_win);
-    draw_fancy_border(main_win, "TRAINING INITIALIZATION");
-    
-    int y = 2;
-    wattron(main_win, COLOR_PAIR(COLOR_INFO));
-    mvwprintw(main_win, y++, 4, "Initializing training system...");
-    mvwprintw(main_win, y++, 4, "Loading puzzle database...");
-    mvwprintw(main_win, y++, 4, "Preparing evaluation parameters...");
-    wattroff(main_win, COLOR_PAIR(COLOR_INFO));
-    
-    y += 2;
-    
-    wattron(main_win, COLOR_PAIR(COLOR_HIGHLIGHT));
-    mvwprintw(main_win, y++, 4, "Training will run for %d iterations", iterations);
-    mvwprintw(main_win, y++, 4, "Testing %d puzzles per iteration", PUZZLE_TEST_COUNT);
-    mvwprintw(main_win, y++, 4, "Search depth: %d", search_depth);
-    wattroff(main_win, COLOR_PAIR(COLOR_HIGHLIGHT));
-    
-    wrefresh(main_win);
-    napms(1500);  // Give more time to see initialization message
-    
-    // Show "Testing..." message before first evaluation
-    werase(main_win);
-    draw_fancy_border(main_win, "TRAINING IN PROGRESS");
-    int test_y = max_y / 2 - 2;
-    wattron(main_win, COLOR_PAIR(COLOR_HIGHLIGHT) | A_BOLD);
-    mvwprintw(main_win, test_y++, (max_x - 40) / 2, "Testing initial parameters...");
-    mvwprintw(main_win, test_y++, (max_x - 40) / 2, "Please wait...");
-    wattroff(main_win, COLOR_PAIR(COLOR_HIGHLIGHT) | A_BOLD);
-    wrefresh(main_win);
-    
-    // Run training with search depth
-    int best_score = train_rewards(iterations, search_depth);
-    
-    // Show completion screen
-    tui_show_training_complete(best_score, iterations);
-}
-
 // Training interface function with TUI display and configurable threads
 void tui_run_training_threaded(const char *puzzle_file, int iterations, int num_threads, int search_depth)
 {
-    (void)puzzle_file;  // Parameter reserved for future use
-    
+    (void)search_depth;  /* no longer used — NN replaces minimax */
+
     int max_y, max_x;
     getmaxyx(main_win, max_y, max_x);
-    
+    (void)max_y; (void)max_x;
+
     // Prompt for training parameters
     werase(main_win);
     draw_fancy_border(main_win, "TRAINING CONFIGURATION");
-    
+
     int y = 2;
     wattron(main_win, COLOR_PAIR(COLOR_TITLE) | A_BOLD);
-    mvwprintw(main_win, y++, 4, "Configure Training Parameters");
+    mvwprintw(main_win, y++, 4, "Configure Neural Network Training Parameters");
     wattroff(main_win, COLOR_PAIR(COLOR_TITLE) | A_BOLD);
-    
+
     y += 2;
-    
+
     // Prompt for number of puzzles
     wattron(main_win, COLOR_PAIR(COLOR_INFO));
     mvwprintw(main_win, y++, 4, "Number of puzzles per iteration (default 500): ");
     wattroff(main_win, COLOR_PAIR(COLOR_INFO));
     wrefresh(main_win);
-    
+
     echo();
     curs_set(1);
     char input[64];
     wgetnstr(main_win, input, sizeof(input) - 1);
     noecho();
     curs_set(0);
-    
+
     int num_puzzles = atoi(input);
     if (num_puzzles <= 0 || num_puzzles > 10000) num_puzzles = 500;
     PUZZLE_TEST_COUNT = num_puzzles;
-    
+
     // Prompt for number of threads
     y++;
     wattron(main_win, COLOR_PAIR(COLOR_INFO));
     mvwprintw(main_win, y++, 4, "Number of threads (default 20): ");
     wattroff(main_win, COLOR_PAIR(COLOR_INFO));
     wrefresh(main_win);
-    
+
     echo();
     curs_set(1);
     wgetnstr(main_win, input, sizeof(input) - 1);
     noecho();
     curs_set(0);
-    
+
     int threads = atoi(input);
     if (threads <= 0 || threads > 256) threads = num_threads;
     num_threads = threads;
-    
+
     // Prompt for number of iterations
     y++;
     wattron(main_win, COLOR_PAIR(COLOR_INFO));
     mvwprintw(main_win, y++, 4, "Number of iterations (default 50): ");
     wattroff(main_win, COLOR_PAIR(COLOR_INFO));
     wrefresh(main_win);
-    
+
     echo();
     curs_set(1);
     wgetnstr(main_win, input, sizeof(input) - 1);
     noecho();
     curs_set(0);
-    
+
     int iters = atoi(input);
     if (iters <= 0 || iters > 10000) iters = iterations;
     iterations = iters;
-    
-    // Prompt for search depth
+
+    // Prompt for learning rate
     y++;
     wattron(main_win, COLOR_PAIR(COLOR_INFO));
-    mvwprintw(main_win, y++, 4, "Search depth (default 4, lower=faster): ");
+    mvwprintw(main_win, y++, 4, "Learning rate (default 0.001): ");
     wattroff(main_win, COLOR_PAIR(COLOR_INFO));
     wrefresh(main_win);
-    
+
     echo();
     curs_set(1);
     wgetnstr(main_win, input, sizeof(input) - 1);
     noecho();
     curs_set(0);
-    
-    int depth_input = atoi(input);
-    if (depth_input <= 0 || depth_input > 10) depth_input = search_depth;
-    search_depth = depth_input;
-    
-    // Prompt for prune margin
-    y++;
-    wattron(main_win, COLOR_PAIR(COLOR_INFO));
-    mvwprintw(main_win, y++, 4, "Prune margin (default 300, higher=more accurate): ");
-    wattroff(main_win, COLOR_PAIR(COLOR_INFO));
-    wrefresh(main_win);
-    
-    echo();
-    curs_set(1);
-    wgetnstr(main_win, input, sizeof(input) - 1);
-    noecho();
-    curs_set(0);
-    
-    int prune_margin_input = atoi(input);
-    if (prune_margin_input <= 0 || prune_margin_input > 2000) prune_margin_input = 300;
-    static_futility_prune_margin = (double)prune_margin_input;
-    
-    // Show initial training screen
+
+    float learning_rate = (float)atof(input);
+    if (learning_rate <= 0.0f || learning_rate > 1.0f) learning_rate = 0.001f;
+
+    // Show initialization screen
     werase(main_win);
     draw_fancy_border(main_win, "TRAINING INITIALIZATION");
-    
+
     y = 2;
     wattron(main_win, COLOR_PAIR(COLOR_INFO));
-    mvwprintw(main_win, y++, 4, "Initializing training system...");
+    mvwprintw(main_win, y++, 4, "Initializing neural network training...");
     mvwprintw(main_win, y++, 4, "Loading puzzle database...");
-    mvwprintw(main_win, y++, 4, "Preparing evaluation parameters...");
+    mvwprintw(main_win, y++, 4, "Preparing neural network weights...");
     wattroff(main_win, COLOR_PAIR(COLOR_INFO));
-    
+
     y += 2;
-    
+
     wattron(main_win, COLOR_PAIR(COLOR_HIGHLIGHT));
     mvwprintw(main_win, y++, 4, "Training will run for %d iterations", iterations);
     mvwprintw(main_win, y++, 4, "Testing %d puzzles per iteration", PUZZLE_TEST_COUNT);
-    mvwprintw(main_win, y++, 4, "Using %d threads for parallel evaluation", num_threads);
-    mvwprintw(main_win, y++, 4, "Search depth: %d", search_depth);
+    mvwprintw(main_win, y++, 4, "Using %d threads for parallel training", num_threads);
+    mvwprintw(main_win, y++, 4, "Learning rate: %.4f", (double)learning_rate);
     wattroff(main_win, COLOR_PAIR(COLOR_HIGHLIGHT));
-    
+
     wrefresh(main_win);
-    napms(1500);  // Give more time to see initialization message
-    
-    // Show "Testing..." message before first evaluation
+    napms(1500);
+
     werase(main_win);
     draw_fancy_border(main_win, "TRAINING IN PROGRESS");
     int test_y = max_y / 2 - 2;
     wattron(main_win, COLOR_PAIR(COLOR_HIGHLIGHT) | A_BOLD);
-    mvwprintw(main_win, test_y++, (max_x - 40) / 2, "Testing initial parameters...");
+    mvwprintw(main_win, test_y++, (max_x - 40) / 2, "Training neural network...");
     mvwprintw(main_win, test_y++, (max_x - 40) / 2, "Please wait...");
     wattroff(main_win, COLOR_PAIR(COLOR_HIGHLIGHT) | A_BOLD);
     wrefresh(main_win);
-    
-    // Run training with specified thread count and search depth
-    int best_score = train_rewards_threaded(iterations, num_threads, search_depth);
-    
+
+    // Switch to the training layout (three columns + thread panel)
+    tui_reconfigure_for_training();
+
+    // Run NN training for the requested number of iterations
+    int best_score = 0;
+    int best_iteration = 0;
+    IterationHistory last_5[5];
+    int history_count = 0;
+
+    struct timespec t_start;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+    for (int iter = 1; iter <= iterations; iter++) {
+        // Update context so the live callback can reference current iteration
+        g_train_ctx.iteration        = iter;
+        g_train_ctx.total_iterations = iterations;
+        g_train_ctx.best_score       = best_score;
+        g_train_ctx.best_iteration   = best_iteration;
+        memcpy(g_train_ctx.last_5, last_5, sizeof(last_5));
+        g_train_ctx.history_count    = history_count;
+        g_train_ctx.t_start          = t_start;
+        g_train_ctx.learning_rate    = learning_rate;
+
+        int score = playPuzzlesMultiThreaded_Train(puzzle_file, learning_rate, num_puzzles, num_threads, training_progress_cb);
+
+        if (score > best_score) {
+            best_score = score;
+            best_iteration = iter;
+        }
+
+        // Shift history ring (keep last 5)
+        if (history_count < 5) {
+            last_5[history_count].iteration  = iter;
+            last_5[history_count].score      = score;
+            last_5[history_count].pass_count = score;
+            history_count++;
+        } else {
+            for (int k = 0; k < 4; k++) last_5[k] = last_5[k + 1];
+            last_5[4].iteration  = iter;
+            last_5[4].score      = score;
+            last_5[4].pass_count = score;
+        }
+
+        struct timespec t_now;
+        clock_gettime(CLOCK_MONOTONIC, &t_now);
+        int elapsed = (int)(t_now.tv_sec - t_start.tv_sec);
+
+        tui_nn_training_display(iter, iterations, score, best_score, best_iteration,
+                                last_5, history_count, elapsed, learning_rate);
+    }
+
     // Show completion screen
     tui_show_training_complete(best_score, iterations);
 }

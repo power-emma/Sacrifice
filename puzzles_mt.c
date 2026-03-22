@@ -5,6 +5,7 @@
 #include <string.h>
 #include <pthread.h>
 #include "chess.h"
+#include "nn.h"
 
 #define MAX_THREADS 256
 
@@ -34,6 +35,8 @@ typedef struct {
     pthread_mutex_t *results_lock;
     int *completed_count;
     int total_puzzles;
+    int   train_nn;        /* 1 = gradient-train the NN (teacher forcing) */
+    float learning_rate;  /* SGD step size when train_nn = 1 */
 } ThreadWorkerArgs;
 
 // Execute a UCI move on the GameState
@@ -237,13 +240,66 @@ static void* puzzle_worker_thread(void *arg)
         
         // Solve puzzle - alternate between AI moves and expected responses
         int puzzle_success = 1;
-        while (token && puzzle_success)
+        int nn_first_move_checked = 0;
+        int nn_first_move_correct = 0;
+        while (token && (puzzle_success || args->train_nn))
         {
-            // AI's turn - compute best move
+            // AI's turn
             enum Colour aiColour = sideToMove;
-            struct MoveSequence bestMove = computeBestMove_ThreadSafe(&state, args->search_depth, aiColour);
+
+            /* ── Training mode: teacher forcing ──────────────────────────────
+             * 1. Build the target board from the expected (correct) move.
+             * 2. Run one SGD step: teach NN that current board → target board.
+             * 3. Ask NN what it would have picked (accuracy tracking only).
+             * 4. Execute the EXPECTED move regardless so subsequent positions
+             *    are always valid (teacher forcing).                          */
+            if (args->train_nn) {
+                const char *expectedMove = token;
+                token = strtok_r(NULL, " ", &saveptr);
+
+                /* Apply expected move to a copy to get target board */
+                struct GameState target_state = state;
+                if (executeUciMove_ThreadSafe(&target_state, expectedMove)) {
+                    nn_train_step(&g_net,
+                                  (const struct Piece (*)[8])state.board,
+                                  (const struct Piece (*)[8])target_state.board,
+                                  args->learning_rate);
+                }
+
+                /* Accuracy check only on first AI move per puzzle.
+                 * This matches the training score definition and avoids
+                 * expensive CPU-side move search on every ply. */
+                if (!nn_first_move_checked) {
+                    struct Move nn_choice = nn_pick_move(&g_net, state.board, aiColour);
+                    char nn_uci[32] = "";
+                    if (nn_choice.fromX >= 0)
+                        snprintf(nn_uci, sizeof(nn_uci), "%c%d%c%d",
+                                 'a' + nn_choice.fromX, nn_choice.fromY + 1,
+                                 'a' + nn_choice.toX,   nn_choice.toY   + 1);
+                    nn_first_move_correct = (strcmp(nn_uci, expectedMove) == 0);
+                    nn_first_move_checked = 1;
+                }
+
+                /* Execute expected move (teacher forcing) */
+                if (!executeUciMove_ThreadSafe(&state, expectedMove))
+                    break;
+                recordBoardHistory_ThreadSafe(&state);
+                sideToMove = (sideToMove == WHITE) ? BLACK : WHITE;
+
+                /* Execute opponent response */
+                if (token) {
+                    if (!executeUciMove_ThreadSafe(&state, token))
+                        break;
+                    recordBoardHistory_ThreadSafe(&state);
+                    sideToMove = (sideToMove == WHITE) ? BLACK : WHITE;
+                    token = strtok_r(NULL, " ", &saveptr);
+                }
+                continue;  /* skip non-training path below */
+            }
+
+            struct Move nn_choice = nn_pick_move(&g_net, state.board, aiColour);
             
-            if (bestMove.count == 0)
+            if (nn_choice.fromX < 0)
             {
                 puzzle_success = 0;
                 break;
@@ -256,8 +312,8 @@ static void* puzzle_worker_thread(void *arg)
             // Format AI's move as UCI
             char aiMoveNotation[32];
             snprintf(aiMoveNotation, sizeof(aiMoveNotation), "%c%d%c%d",
-                     'a' + bestMove.moves[0].fromX, bestMove.moves[0].fromY + 1,
-                     'a' + bestMove.moves[0].toX, bestMove.moves[0].toY + 1);
+                     'a' + nn_choice.fromX, nn_choice.fromY + 1,
+                     'a' + nn_choice.toX,   nn_choice.toY   + 1);
             
             // Check if move matches expected
             if (strcmp(aiMoveNotation, expectedMove) != 0)
@@ -266,10 +322,10 @@ static void* puzzle_worker_thread(void *arg)
                 enum Colour opponentColour = (aiColour == WHITE) ? BLACK : WHITE;
                 
                 // Execute the AI's move to check for checkmate
-                int fx = bestMove.moves[0].fromX;
-                int fy = bestMove.moves[0].fromY;
-                int tx = bestMove.moves[0].toX;
-                int ty = bestMove.moves[0].toY;
+                int fx = nn_choice.fromX;
+                int fy = nn_choice.fromY;
+                int tx = nn_choice.toX;
+                int ty = nn_choice.toY;
                 
                 state.board[tx][ty] = state.board[fx][fy];
                 state.board[fx][fy].type = -1;
@@ -336,13 +392,15 @@ static void* puzzle_worker_thread(void *arg)
         }
         
         // Store result
-        args->results[puzzle_idx] = puzzle_success ? 1 : 0;
+        args->results[puzzle_idx] =
+            (args->train_nn ? nn_first_move_correct : puzzle_success) ? 1 : 0;
         
         // Update thread status with result
         if (thread_id >= 0)
         {
             pthread_mutex_lock(&status_mutex);
-            global_thread_statuses[thread_id].last_result = puzzle_success ? 1 : 0;
+            global_thread_statuses[thread_id].last_result =
+                (args->train_nn ? nn_first_move_correct : puzzle_success) ? 1 : 0;
             pthread_mutex_unlock(&status_mutex);
         }
         
@@ -422,6 +480,8 @@ int playPuzzlesMultiThreaded(const char *filename, int searchDepth, int numPuzzl
         thread_args[i].results_lock = &results_lock;
         thread_args[i].completed_count = &completed_count;
         thread_args[i].total_puzzles = numPuzzles;
+        thread_args[i].train_nn = 0;
+        thread_args[i].learning_rate = 0.0f;
         
         if (pthread_create(&threads[i], NULL, puzzle_worker_thread, &thread_args[i]) != 0)
         {
@@ -493,4 +553,102 @@ int* get_thread_puzzle_statuses(int *num_threads_out, int *statuses_out)
     pthread_mutex_unlock(&status_mutex);
     
     return statuses_out;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * playPuzzlesMultiThreaded_Train
+ *
+ * Runs the puzzle loop with NN training (teacher forcing) enabled on every
+ * worker thread.  After all threads finish the weights are written to
+ * "nn_weights.bin" so progress survives between runs.
+ *
+ * Returns the number of puzzles where the NN predicted the correct move.
+ * ════════════════════════════════════════════════════════════════════════════ */
+int playPuzzlesMultiThreaded_Train(const char *filename, float learning_rate,
+                                   int numPuzzles, int numThreads,
+                                   void (*progress_callback)(int, int, int))
+{
+    if (numThreads < 1) numThreads = 1;
+    if (numThreads > MAX_THREADS) numThreads = MAX_THREADS;
+
+    /* Initialise (or load) NN weights once before spawning threads */
+    if (!g_net.weights) {
+        if (!nn_load(&g_net, "nn_weights.bin"))
+            nn_init(&g_net);
+    }
+
+    /* Initialise thread status tracking */
+    pthread_mutex_lock(&status_mutex);
+    global_num_threads = numThreads;
+    for (int i = 0; i < MAX_THREADS; i++) {
+        global_thread_statuses[i].thread_id   = -1;
+        global_thread_statuses[i].current_puzzle = -1;
+        global_thread_statuses[i].last_result = -1;
+        global_thread_statuses[i].is_active   = 0;
+    }
+    pthread_mutex_unlock(&status_mutex);
+
+    int *results = (int *)calloc(numPuzzles, sizeof(int));
+    if (!results) { fprintf(stderr, "OOM in playPuzzlesMultiThreaded_Train\n"); return 0; }
+
+    pthread_mutex_t results_lock = PTHREAD_MUTEX_INITIALIZER;
+    int completed_count = 0;
+
+    pthread_t threads[MAX_THREADS];
+    ThreadWorkerArgs thread_args[MAX_THREADS];
+
+    int puzzles_per_thread = numPuzzles / numThreads;
+    int remainder          = numPuzzles % numThreads;
+    int start_puzzle       = 0;
+
+    for (int i = 0; i < numThreads; i++) {
+        int end_puzzle = start_puzzle + puzzles_per_thread + (i < remainder ? 1 : 0);
+
+        thread_args[i].puzzle_file      = filename;
+        thread_args[i].search_depth     = 0;          /* unused in training mode */
+        thread_args[i].start_puzzle     = start_puzzle;
+        thread_args[i].end_puzzle       = end_puzzle;
+        thread_args[i].results          = results;
+        thread_args[i].progress_callback= progress_callback;
+        thread_args[i].results_lock     = &results_lock;
+        thread_args[i].completed_count  = &completed_count;
+        thread_args[i].total_puzzles    = numPuzzles;
+        thread_args[i].train_nn         = 1;
+        thread_args[i].learning_rate    = learning_rate;
+
+        if (pthread_create(&threads[i], NULL, puzzle_worker_thread, &thread_args[i]) != 0) {
+            fprintf(stderr, "Failed to create training thread %d\n", i);
+            free(results);
+            return 0;
+        }
+        start_puzzle = end_puzzle;
+    }
+
+    for (int i = 0; i < numThreads; i++)
+        pthread_join(threads[i], NULL);
+
+    /* Tally results */
+    int passes = 0;
+    for (int i = 0; i < numPuzzles; i++)
+        if (results[i] == 1) passes++;
+
+    if (progress_callback)
+        progress_callback(numPuzzles, numPuzzles, passes);
+
+    free(results);
+    pthread_mutex_destroy(&results_lock);
+
+    /* Persist updated weights */
+    if (nn_save(&g_net, "nn_weights.bin"))
+        printf("NN weights saved to nn_weights.bin\n");
+
+    return passes;
+}
+
+/* Convenience wrapper using the global puzzle count and default learning rate */
+int playPuzzles1To100_MT_Train(const char *filename, float learning_rate, int numThreads)
+{
+    return playPuzzlesMultiThreaded_Train(filename, learning_rate,
+                                          PUZZLE_TEST_COUNT, numThreads,
+                                          puzzle_progress_callback);
 }
